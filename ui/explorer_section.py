@@ -134,8 +134,8 @@ def render_explorer_section() -> None:
             missing_only = st.checkbox("Missing only", value=False)
         with g2:
             min_freq = st.number_input("Min. freq", min_value=1, max_value=10000, value=1, step=1)
-        with g3:
-            html_block("")
+        # g3 intentionally left empty — it's a layout spacer so the two
+        # narrow controls above don't stretch across the whole row.
 
         filtered = _filter_values(
             result.values,

@@ -78,7 +78,13 @@ def html_block(markup: str) -> None:
     permissive than the markdown sanitizer and *not* iframed, so global
     styles inject into the main document. This helper prefers it and falls
     back to ``st.markdown`` on older versions so the module still imports.
+
+    ``st.html`` rejects empty bodies with ``StreamlitAPIException``; we silently
+    no-op on empty/whitespace input so callers can use this as a conditional
+    emitter without guarding every call.
     """
+    if not markup or not markup.strip():
+        return
     if hasattr(st, "html"):
         st.html(markup)
     else:
