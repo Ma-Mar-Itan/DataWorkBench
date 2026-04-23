@@ -14,7 +14,7 @@ import streamlit as st
 from core.exporter import apply_rules, suggest_output_filename
 from core.ruleset_store import RuleSetStore
 from models.schemas import CleaningRule, RuleSet
-from ui.layout import card, caption, chip, render_metrics, rule as divider
+from ui.layout import caption, card, chip, html_block, render_metrics, rule as divider
 
 
 def _step_state() -> str:
@@ -143,15 +143,12 @@ def render_export_section(store: RuleSetStore) -> None:
         if summary and output_bytes:
             divider()
             total_changed = summary["cells_replaced"] + summary["cells_blanked"]
-            st.markdown(
-                f'<div style="margin-bottom:14px;">'
+            html_block(f'<div style="margin-bottom:14px;">'
                 f'{chip("Workbook generated", "ok")} '
                 f'<span style="margin-left:10px; font-size:12.5px; color:var(--tw-ink-3);">'
                 f'{total_changed:,} cell{"s" if total_changed != 1 else ""} changed '
                 f'across {summary["sheet_count"]} sheet{"s" if summary["sheet_count"] != 1 else ""}.'
-                f'</span></div>',
-                unsafe_allow_html=True,
-            )
+                f'</span></div>')
 
             render_metrics(
                 [
@@ -186,12 +183,9 @@ def render_export_section(store: RuleSetStore) -> None:
                             f'font-size:12.5px; color:var(--tw-ink-3);">{count:,}</td>'
                             f'</tr>'
                         )
-                    st.markdown(
-                        f'<table style="width:100%; border-collapse:collapse;">{"".join(rows)}</table>',
-                        unsafe_allow_html=True,
-                    )
+                    html_block(f'<table style="width:100%; border-collapse:collapse;">{"".join(rows)}</table>')
 
-            st.markdown('<div style="height:14px;"></div>', unsafe_allow_html=True)
+            html_block('<div style="height:14px;"></div>')
             st.download_button(
                 label=f"Download {filename}",
                 data=output_bytes,

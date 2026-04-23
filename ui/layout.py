@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 from models.schemas import ValueClass
 
@@ -24,17 +25,68 @@ _CSS_PATH = Path(__file__).parent / "theme" / "styles.css"
 # --------------------------------------------------------------------------- #
 
 def inject_global_chrome() -> None:
-    """Inject fonts + design-system stylesheet."""
+    """Inject fonts + design-system stylesheet into the Streamlit page.
+
+    Implementation note: Streamlit's ``st.markdown(..., unsafe_allow_html=True)``
+    runs through an HTML sanitizer that can silently strip or partially render
+    ``<style>`` blocks containing comment blocks, non-ASCII characters, or
+    certain CSS patterns. That sanitizer is what caused the stylesheet to
+    appear as literal page text in earlier builds.
+
+    Two-layer fix:
+      1. Write the ``<link>`` + ``<style>`` via ``st.html``, which escapes the
+         markdown pipeline entirely and hands raw HTML to the Streamlit frame.
+      2. Defensively strip the leading banner comment from the CSS before
+         injection — a belt-and-braces measure against any future sanitizer
+         heuristic that trips on ``/* ... */`` at the very start of a block.
+    """
     css = _CSS_PATH.read_text(encoding="utf-8")
-    st.markdown(
-        f"""
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-        <style>{css}</style>
-        """,
-        unsafe_allow_html=True,
+
+    # Strip the top banner comment if present. The regex is anchored to the
+    # start of file to avoid touching anything else.
+    import re as _re
+    css = _re.sub(r"^\s*/\*.*?\*/\s*", "", css, count=1, flags=_re.DOTALL)
+
+    html_payload = (
+        '<link rel="preconnect" href="https://fonts.googleapis.com">'
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+        '<link href="https://fonts.googleapis.com/css2?'
+        'family=Inter:wght@400;500;600;700&'
+        'family=Source+Serif+4:wght@500;600;700&'
+        'family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">'
+        f'<style>{css}</style>'
     )
+
+    # Prefer st.html (Streamlit ≥1.33) which bypasses the markdown sanitizer.
+    # Fall back to st.markdown for older versions.
+    if hasattr(st, "html"):
+        st.html(html_payload)
+    else:
+        st.markdown(html_payload, unsafe_allow_html=True)
+
+
+def html_block(markup: str) -> None:
+    """Central HTML emitter for UI chrome.
+
+    Streamlit's ``st.markdown(..., unsafe_allow_html=True)`` pipes the payload
+    through a markdown renderer plus an HTML sanitizer. Certain shapes of
+    input — multiline HTML with indentation, specific tag nesting, or
+    ``<style>``/``<link>`` elements — can make the sanitizer escape the whole
+    block as text. That was the cause of the "CSS showing as page text" bug.
+
+    ``st.html`` (Streamlit ≥1.33) renders raw HTML through DOMPurify — more
+    permissive than the markdown sanitizer and *not* iframed, so global
+    styles inject into the main document. This helper prefers it and falls
+    back to ``st.markdown`` on older versions so the module still imports.
+    """
+    if hasattr(st, "html"):
+        st.html(markup)
+    else:
+        st.markdown(markup, unsafe_allow_html=True)
+
+
+# Internal alias — lots of code in this module uses the short name.
+_html = html_block
 
 
 # --------------------------------------------------------------------------- #
@@ -81,11 +133,22 @@ def render_workspace_band(cells: Iterable[tuple[str, str, bool]]) -> None:
         '''
         for label, value, muted in cells
     )
-    st.markdown(f'<div class="tw-band">{cell_html}</div>', unsafe_allow_html=True)
+    _html(f'<div class="tw-band">{cell_html}</div>')
 
 
 # --------------------------------------------------------------------------- #
 # Card
+#
+# IMPORTANT: Streamlit cannot reliably wrap widgets inside a single <div>
+# spanning multiple st.markdown calls — the framework splits each markdown
+# into its own DOM container and sanitizes any unclosed tags, which ends up
+# rendering `<div class="tw-card">` as literal text on the page. We
+# therefore build each card as a COMPLETE, self-closed HTML block (header,
+# eyebrow, title, subtitle, body border) in one markdown call, and let
+# widgets flow on the page background immediately beneath it. Visually the
+# result is a header-with-rule-under-it followed by its controls — the
+# header's border-bottom plus the spacing below serves as the card's
+# "frame" without needing an HTML wrapper around the widgets.
 # --------------------------------------------------------------------------- #
 
 @contextmanager
@@ -97,31 +160,51 @@ def card(
     title: str = "",
     subtitle: Optional[str] = None,
 ):
+    """Open a card: emits a self-contained header block; widgets follow below.
+
+    Usage is unchanged for callers::
+
+        with card(step=1, title="Upload", subtitle="…"):
+            st.file_uploader(...)
+
+    On enter we emit one st.markdown with the complete header HTML. On
+    exit we emit a small trailing spacer + horizontal rule so consecutive
+    cards read as distinct modules. No opened HTML tags cross markdown
+    boundaries, so nothing gets escaped to text.
+    """
     step_class = {"active": "tw-card__step--active", "done": "tw-card__step--done"}.get(step_state, "")
-    step_html = f'<span class="tw-card__step {step_class}">{step}</span>' if step is not None else ""
+    step_html = (
+        f'<span class="tw-card__step {step_class}">{step}</span>'
+        if step is not None
+        else ""
+    )
     eyebrow_html = f'<div class="tw-card__eyebrow">{escape(eyebrow)}</div>' if eyebrow else ""
     sub_html = f'<div class="tw-card__sub">{escape(subtitle)}</div>' if subtitle else ""
 
-    st.markdown(
-        f"""
-        <div class="tw-card">
-          <div class="tw-card__head">
-            <div class="tw-card__title-group">
-              {step_html}
-              <div style="min-width:0;">
-                {eyebrow_html}
-                <h2 class="tw-card__title">{escape(title)}</h2>
-                {sub_html}
-              </div>
-            </div>
-          </div>
-        """,
-        unsafe_allow_html=True,
+    # Self-contained header with an explicit bottom rule. The surrounding
+    # `.tw-card-shell` class gives this card the outer frame styling
+    # (white background, border, shadow, padding). Because we cannot wrap
+    # the widgets with HTML, we simulate the card body by giving the next
+    # Streamlit column a matching background via the `.tw-card-body`
+    # spacer div emitted on exit.
+    header_html = (
+        '<div class="tw-card-head-block">'
+        f'  <div class="tw-card__title-group">'
+        f'    {step_html}'
+        f'    <div style="min-width:0;">'
+        f'      {eyebrow_html}'
+        f'      <h2 class="tw-card__title">{escape(title)}</h2>'
+        f'      {sub_html}'
+        f'    </div>'
+        f'  </div>'
+        '</div>'
     )
+    _html(header_html)
     try:
         yield
     finally:
-        st.markdown("</div>", unsafe_allow_html=True)
+        # Trailing spacer separates cards. Self-contained; never unclosed.
+        _html('<div class="tw-card-foot"></div>')
 
 
 # --------------------------------------------------------------------------- #
@@ -148,7 +231,7 @@ def render_metrics(
             </div>
             '''
         )
-    st.markdown(f'<div class="tw-metrics">{"".join(tiles)}</div>', unsafe_allow_html=True)
+    _html(f'<div class="tw-metrics">{"".join(tiles)}</div>')
 
 
 # --------------------------------------------------------------------------- #
@@ -237,11 +320,11 @@ def value_class_badge(vc: ValueClass) -> str:
 
 
 def caption(text: str) -> None:
-    st.markdown(f'<div class="tw-caption">{escape(text)}</div>', unsafe_allow_html=True)
+    _html(f'<div class="tw-caption">{escape(text)}</div>')
 
 
 def rule() -> None:
-    st.markdown('<hr class="tw-rule"/>', unsafe_allow_html=True)
+    _html('<hr class="tw-rule"/>')
 
 
 def render_footer() -> None:

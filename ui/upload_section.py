@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from ui.layout import card, caption, chip
+from ui.layout import caption, card, chip, html_block
 
 
 _DOWNSTREAM_KEYS = (
@@ -70,8 +70,7 @@ def render_upload_section() -> None:
 
         kb = file_size / 1024
         size_label = f"{kb:,.1f} KB" if kb < 1024 else f"{kb / 1024:,.2f} MB"
-        st.markdown(
-            f"""
+        html_block(f"""
             <div style="display:flex; align-items:center; justify-content:space-between;
                         background: var(--tw-ok-soft); border: 1px solid var(--tw-ok-border);
                         border-radius: var(--tw-radius); padding: 12px 16px; margin-top: 14px;">
@@ -83,6 +82,4 @@ def render_upload_section() -> None:
               </div>
               <div>{chip("Loaded", "ok")}</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            """)

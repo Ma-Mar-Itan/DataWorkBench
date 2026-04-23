@@ -24,7 +24,7 @@ from models.schemas import (
     ScopeType,
     ValueClass,
 )
-from ui.layout import card, caption, chip, value_class_badge
+from ui.layout import caption, card, chip, html_block, value_class_badge
 
 
 # --------------------------------------------------------------------------- #
@@ -135,7 +135,7 @@ def render_explorer_section() -> None:
         with g2:
             min_freq = st.number_input("Min. freq", min_value=1, max_value=10000, value=1, step=1)
         with g3:
-            st.markdown("", unsafe_allow_html=True)
+            html_block("")
 
         filtered = _filter_values(
             result.values,
@@ -148,21 +148,15 @@ def render_explorer_section() -> None:
         )
 
         # -------- Summary line --------
-        st.markdown(
-            f'<div style="margin:4px 0 10px; font-size:12.5px; color:var(--tw-ink-3);">'
+        html_block(f'<div style="margin:4px 0 10px; font-size:12.5px; color:var(--tw-ink-3);">'
             f'<b>{len(filtered):,}</b> of <b>{result.unique_value_count:,}</b> unique values match filters.'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+            f'</div>')
 
         if not filtered:
-            st.markdown(
-                '<div style="margin-top:6px; padding:18px; text-align:center; '
+            html_block('<div style="margin-top:6px; padding:18px; text-align:center; '
                 'color:var(--tw-ink-3); font-size:13px; background:var(--tw-surface-2); '
                 'border:1px dashed var(--tw-border-strong); border-radius:var(--tw-radius);">'
-                'No values match the current filters.</div>',
-                unsafe_allow_html=True,
-            )
+                'No values match the current filters.</div>')
             return
 
         # -------- Table --------
@@ -212,11 +206,8 @@ def render_explorer_section() -> None:
 
         s1, s2 = st.columns([2, 3])
         with s1:
-            st.markdown(
-                f'<div style="padding-top:6px; font-size:12.5px; color:var(--tw-ink-3);">'
-                f'<b>{sel_count}</b> value{"s" if sel_count != 1 else ""} selected.</div>',
-                unsafe_allow_html=True,
-            )
+            html_block(f'<div style="padding-top:6px; font-size:12.5px; color:var(--tw-ink-3);">'
+                f'<b>{sel_count}</b> value{"s" if sel_count != 1 else ""} selected.</div>')
         with s2:
             act_c1, act_c2 = st.columns(2)
             with act_c1:
@@ -257,15 +248,9 @@ def render_explorer_section() -> None:
             st.success(f"Added {added} draft rule{'s' if added != 1 else ''} to the workspace.")
 
         # -------- Column profiles --------
-        st.markdown(
-            '<div style="margin-top:22px; padding-top:18px; border-top:1px solid var(--tw-border);"></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            '<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
-            'color:var(--tw-ink-4); font-weight:600; margin-bottom:10px;">Column profiles</div>',
-            unsafe_allow_html=True,
-        )
+        html_block('<div style="margin-top:22px; padding-top:18px; border-top:1px solid var(--tw-border);"></div>')
+        html_block('<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
+            'color:var(--tw-ink-4); font-weight:600; margin-bottom:10px;">Column profiles</div>')
 
         # Filter profiles to currently-selected sheet (if any).
         profiles_to_show = result.column_profiles
@@ -295,7 +280,4 @@ def render_explorer_section() -> None:
                     f'color:var(--tw-ink-3); text-align:right;">{count:,}</td></tr>'
                     for raw, count in p.top_values
                 )
-                st.markdown(
-                    f'<table style="width:100%; border-collapse:collapse;">{rows}</table>',
-                    unsafe_allow_html=True,
-                )
+                html_block(f'<table style="width:100%; border-collapse:collapse;">{rows}</table>')

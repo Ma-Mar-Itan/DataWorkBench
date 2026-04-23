@@ -11,7 +11,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core.ruleset_store import RuleSetStore
-from ui.layout import card, caption, chip
+from ui.layout import caption, card, chip, html_block
 
 
 def render_rulesets_section(store: RuleSetStore) -> None:
@@ -35,12 +35,9 @@ def render_rulesets_section(store: RuleSetStore) -> None:
             return
 
         # Summary line.
-        st.markdown(
-            f'<div style="margin-bottom:10px; font-size:12.5px; color:var(--tw-ink-3);">'
+        html_block(f'<div style="margin-bottom:10px; font-size:12.5px; color:var(--tw-ink-3);">'
             f'{chip(f"{len(names)} saved", "info")} &nbsp;'
-            f'<span style="margin-left:8px;">Ready to apply to any workbook.</span></div>',
-            unsafe_allow_html=True,
-        )
+            f'<span style="margin-left:8px;">Ready to apply to any workbook.</span></div>')
 
         # Pick one.
         c1, c2, c3 = st.columns([3, 1, 1])
@@ -83,14 +80,11 @@ def render_rulesets_section(store: RuleSetStore) -> None:
                     rs = store.load(name)
                 except Exception:  # noqa: BLE001
                     continue
-                st.markdown(
-                    f'<div style="padding:8px 10px; border-bottom:1px solid var(--tw-border); '
+                html_block(f'<div style="padding:8px 10px; border-bottom:1px solid var(--tw-border); '
                     f'display:flex; justify-content:space-between; align-items:baseline;">'
                     f'<div><b style="font-size:13.5px; color:var(--tw-ink);">{name}</b>'
                     f' &nbsp; <span style="font-size:12px; color:var(--tw-ink-3);">{rs.description or "—"}</span>'
                     f'</div>'
                     f'<div style="font-family:var(--tw-font-mono); font-size:12px; color:var(--tw-ink-3);">'
                     f'{len(rs.rules)} rule{"s" if len(rs.rules) != 1 else ""}</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
+                    f'</div>')

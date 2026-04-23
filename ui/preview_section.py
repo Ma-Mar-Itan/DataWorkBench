@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from core.preview import DEFAULT_PREVIEW_ROWS, build_preview, list_sheet_names
-from ui.layout import card, caption
+from ui.layout import caption, card, html_block
 
 
 def _step_state() -> str:
@@ -67,8 +67,7 @@ def _render_highlighted_table(
             )
         body_rows.append(f'<tr>{"".join(cells)}</tr>')
 
-    st.markdown(
-        f"""
+    html_block(f"""
         <div style="border:1px solid var(--tw-border); border-radius:var(--tw-radius);
                     overflow:auto; max-height:500px;">
           <table style="border-collapse:collapse; width:100%; font-family:var(--tw-font-sans);">
@@ -76,9 +75,7 @@ def _render_highlighted_table(
             <tbody>{"".join(body_rows)}</tbody>
           </table>
         </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        """)
 
 
 def render_preview_section() -> None:
@@ -141,12 +138,9 @@ def render_preview_section() -> None:
 
         # Change count summary.
         changed_count = int(mask.sum().sum())
-        st.markdown(
-            f'<div style="margin:4px 0 12px; font-size:12.5px; color:var(--tw-ink-3);">'
+        html_block(f'<div style="margin:4px 0 12px; font-size:12.5px; color:var(--tw-ink-3);">'
             f'<b>{changed_count:,}</b> cell{"s" if changed_count != 1 else ""} would change '
-            f'in the first {len(orig_df):,} row{"s" if len(orig_df) != 1 else ""} of this sheet.</div>',
-            unsafe_allow_html=True,
-        )
+            f'in the first {len(orig_df):,} row{"s" if len(orig_df) != 1 else ""} of this sheet.</div>')
 
         tab_clean, tab_orig, tab_side = st.tabs(["Cleaned", "Original", "Side by side"])
         with tab_clean:
@@ -156,16 +150,10 @@ def render_preview_section() -> None:
         with tab_side:
             co, cc = st.columns(2)
             with co:
-                st.markdown(
-                    '<div style="font-size:11px; letter-spacing:0.1em; text-transform:uppercase; '
-                    'color:var(--tw-ink-4); font-weight:600; margin-bottom:6px;">Original</div>',
-                    unsafe_allow_html=True,
-                )
+                html_block('<div style="font-size:11px; letter-spacing:0.1em; text-transform:uppercase; '
+                    'color:var(--tw-ink-4); font-weight:600; margin-bottom:6px;">Original</div>')
                 st.dataframe(orig_df, use_container_width=True, hide_index=True, height=380)
             with cc:
-                st.markdown(
-                    '<div style="font-size:11px; letter-spacing:0.1em; text-transform:uppercase; '
-                    'color:var(--tw-accent); font-weight:600; margin-bottom:6px;">Cleaned</div>',
-                    unsafe_allow_html=True,
-                )
+                html_block('<div style="font-size:11px; letter-spacing:0.1em; text-transform:uppercase; '
+                    'color:var(--tw-accent); font-weight:600; margin-bottom:6px;">Cleaned</div>')
                 _render_highlighted_table(clean_df, orig_df, mask)

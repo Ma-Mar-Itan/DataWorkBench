@@ -194,40 +194,51 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 .tw-band__value--muted { color: var(--tw-band-ink-2); font-style: italic; }
 
 /* =============================================================
-   4. Card
+   4. Card — header-only model
+
+   Because we cannot wrap Streamlit widgets in a single <div> across
+   multiple st.markdown calls (the framework escapes the orphaned halves
+   to literal text on the page), each "card" is actually a header BLOCK
+   plus a trailing spacer, with the body widgets flowing between them on
+   the page background. The thick accent-colored left rule + the lower
+   hairline plus generous padding give this header-only model a clear
+   sense of module framing without any HTML body wrapper.
    ============================================================= */
 
-.tw-card {
+.tw-card-head-block {
   background: var(--tw-surface);
   border: 1px solid var(--tw-border);
+  border-left: 3px solid var(--tw-accent);
   border-radius: var(--tw-radius-lg);
   box-shadow: var(--tw-shadow-1);
-  padding: 26px 30px;
+  padding: 22px 28px 20px 26px;
   margin-bottom: 18px;
 }
-.tw-card__head {
-  display: flex; align-items: flex-start; justify-content: space-between;
-  gap: 24px;
-  padding-bottom: 16px;
-  border-bottom: 1px solid var(--tw-border);
-  margin-bottom: 20px;
+
+.tw-card__title-group {
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
 }
-.tw-card__title-group { min-width: 0; display: flex; align-items: flex-start; }
+
 .tw-card__eyebrow {
   font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
   color: var(--tw-accent); font-weight: 600; margin-bottom: 6px;
 }
+
 .tw-card__title {
   font-family: var(--tw-font-serif);
   font-size: 22px; font-weight: 600;
   color: var(--tw-ink);
   letter-spacing: -0.015em; line-height: 1.2; margin: 0;
 }
+
 .tw-card__sub {
   margin-top: 6px;
   font-size: 13.5px; color: var(--tw-ink-3);
   max-width: 68ch; line-height: 1.55;
 }
+
 .tw-card__step {
   width: 28px; height: 28px;
   border-radius: 50%;
@@ -247,6 +258,14 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
   background: var(--tw-ok-soft);
   border-color: var(--tw-ok);
   color: var(--tw-ok);
+}
+
+/* Trailing spacer below each card's widgets. Adds breathing room and
+   visually separates one module from the next. */
+.tw-card-foot {
+  height: 1px;
+  margin: 4px 0 28px 0;
+  background: var(--tw-border);
 }
 
 /* =============================================================

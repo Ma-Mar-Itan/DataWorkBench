@@ -10,7 +10,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core.extractor import scan_workbook
-from ui.layout import card, caption, chip, render_metrics
+from ui.layout import caption, card, chip, html_block, render_metrics
 
 
 def _step_state() -> str:
@@ -47,11 +47,8 @@ def render_scan_section() -> None:
             rescan = st.button("Scan workbook", type="primary", use_container_width=True)
         with info:
             if "scan_result" in st.session_state:
-                st.markdown(
-                    f'<div style="padding-top:6px; font-size:12.5px; color:var(--tw-ink-3);">'
-                    f'Last scan complete. {chip("Ready to build rules", "accent")}</div>',
-                    unsafe_allow_html=True,
-                )
+                html_block(f'<div style="padding-top:6px; font-size:12.5px; color:var(--tw-ink-3);">'
+                    f'Last scan complete. {chip("Ready to build rules", "accent")}</div>')
             else:
                 caption("Formula cells are detected and skipped. Nothing is written to disk.")
 
@@ -78,7 +75,7 @@ def render_scan_section() -> None:
             accent_index=2,
         )
 
-        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        html_block('<div style="height:10px;"></div>')
 
         render_metrics(
             [
@@ -90,11 +87,8 @@ def render_scan_section() -> None:
         )
 
         if result.unique_value_count == 0:
-            st.markdown(
-                '<div style="margin-top:16px; padding:12px 14px; border-radius:var(--tw-radius); '
+            html_block('<div style="margin-top:16px; padding:12px 14px; border-radius:var(--tw-radius); '
                 'background: var(--tw-warn-soft); border:1px solid var(--tw-warn-border); '
                 'font-size:13px; color:var(--tw-warn);">'
                 'No string values were detected. There is nothing to clean in this workbook.'
-                '</div>',
-                unsafe_allow_html=True,
-            )
+                '</div>')

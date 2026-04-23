@@ -22,7 +22,7 @@ from models.schemas import (
     MatchMode,
     ScopeType,
 )
-from ui.layout import card, caption, chip, rule as divider
+from ui.layout import caption, card, chip, html_block, rule as divider
 
 
 # --------------------------------------------------------------------------- #
@@ -173,14 +173,11 @@ def _render_rule_grid() -> None:
     """Tabular editor for all active rules."""
     rules = _rules()
     if not rules:
-        st.markdown(
-            '<div style="padding:22px; text-align:center; '
+        html_block('<div style="padding:22px; text-align:center; '
             'color:var(--tw-ink-3); font-size:13px; background:var(--tw-surface-2); '
             'border:1px dashed var(--tw-border-strong); border-radius:var(--tw-radius);">'
             'No rules yet. Add one above, seed from the value explorer, '
-            'or start from a preset.</div>',
-            unsafe_allow_html=True,
-        )
+            'or start from a preset.</div>')
         return
 
     # Build a DataFrame with editable fields where appropriate.
@@ -285,28 +282,19 @@ def _render_validation_summary() -> None:
         if errs:
             errors.append((r, errs))
 
-    st.markdown(
-        f'<div style="margin-top:10px; font-size:12.5px; color:var(--tw-ink-3);">'
+    html_block(f'<div style="margin-top:10px; font-size:12.5px; color:var(--tw-ink-3);">'
         f'{chip(f"{enabled}/{total} enabled", "accent")}'
         + (f' &nbsp; {chip(f"{len(errors)} invalid", "warn")}' if errors else "")
-        + '</div>',
-        unsafe_allow_html=True,
-    )
+        + '</div>')
 
     if errors:
         with st.expander(f"⚠ {len(errors)} rule(s) have validation issues", expanded=False):
             for r, errs in errors:
-                st.markdown(
-                    f'<div style="font-family:var(--tw-font-mono); font-size:12.5px; '
+                html_block(f'<div style="font-family:var(--tw-font-mono); font-size:12.5px; '
                     f'margin:4px 0; color:var(--tw-ink);"><b>{r.source_value or "(empty)"}'
-                    f' → {r.target_value}</b></div>',
-                    unsafe_allow_html=True,
-                )
+                    f' → {r.target_value}</b></div>')
                 for e in errs:
-                    st.markdown(
-                        f'<div style="font-size:12px; color:var(--tw-warn); margin-left:12px;">• {e}</div>',
-                        unsafe_allow_html=True,
-                    )
+                    html_block(f'<div style="font-size:12px; color:var(--tw-warn); margin-left:12px;">• {e}</div>')
 
 
 # --------------------------------------------------------------------------- #
@@ -333,11 +321,8 @@ def render_rules_section() -> None:
         columns_by_sheet = result.columns_by_sheet()
 
         # --- Preset chooser ---
-        st.markdown(
-            '<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
-            'color:var(--tw-ink-4); font-weight:600; margin-bottom:8px;">Preset templates</div>',
-            unsafe_allow_html=True,
-        )
+        html_block('<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
+            'color:var(--tw-ink-4); font-weight:600; margin-bottom:8px;">Preset templates</div>')
         _render_preset_chooser()
 
         divider()
@@ -346,10 +331,7 @@ def render_rules_section() -> None:
         _render_quick_add(result.sheet_names, columns_by_sheet)
 
         # --- Grid ---
-        st.markdown(
-            '<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
-            'color:var(--tw-ink-4); font-weight:600; margin:14px 0 8px;">Active rules</div>',
-            unsafe_allow_html=True,
-        )
+        html_block('<div style="font-size:11px; letter-spacing:0.12em; text-transform:uppercase; '
+            'color:var(--tw-ink-4); font-weight:600; margin:14px 0 8px;">Active rules</div>')
         _render_rule_grid()
         _render_validation_summary()
