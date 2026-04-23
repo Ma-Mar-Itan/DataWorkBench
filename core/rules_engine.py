@@ -1,200 +1,185 @@
 """
-Rule evaluation engine.
+Rules engine.
 
-Given a list of ``CleaningRule`` objects and a cell's context
-(sheet name, column label, raw value), return the rule — if any — that
-applies to that cell. The engine is used by both the exporter and the
-preview builder, guaranteeing the user sees the same result in both.
+Core guarantee (non-negotiable):
+  ALL matching is whole-cell. We compare either the full raw cell value
+  to the rule's source_value, or the full normalized cell value to the
+  normalized source_value. We never do substring or token matching.
+  Therefore replacing "Home" cannot affect "Homework", and replacing a
+  short Arabic word cannot affect a longer Arabic phrase that contains it.
 
-Rule priority
--------------
-When multiple rules could match one cell, we apply the **most specific**:
+Precedence (when multiple enabled rules match a single cell):
+  1. Scope narrowness: column  >  sheet  >  workbook
+  2. Match mode:       exact_raw  >  exact_normalized
+  3. Creation order:   earlier-created rule wins
 
-  1. COLUMN-scoped rule (matches this sheet and this column)
-  2. SHEET-scoped rule  (matches this sheet)
-  3. GLOBAL-scoped rule (matches any sheet/column)
+Formula cells are skipped by default — we never rewrite an '=SUM(...)'
+cell even if the cached value matches.
 
-Within the same specificity tier, ``EXACT_RAW`` wins over
-``EXACT_NORMALIZED``. Within the same scope *and* mode, the first rule in
-the input order wins — the UI is responsible for presenting rules in a
-meaningful order (e.g. most-recently-edited first).
-
-Never substring
----------------
-The engine never performs substring matching. A rule's source value must
-equal the whole cell's value (raw or normalized, depending on mode). This
-preserves the safety invariant: a rule mapping "home" to "house" will not
-touch a cell whose value is "homework".
-
-Formula cells
--------------
-The engine never sees formula cells; the caller (exporter / preview)
-filters them out upstream. The engine doesn't know about formulas at all.
+The engine is stateless: `apply_rules` receives rules + workbook, returns
+an ApplyResult plus (optionally) mutates the underlying openpyxl workbook
+so the exporter can write it out.
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Iterable
 
-from core.normalizer import normalize_value
-from models.schemas import ActionType, CleaningRule, MatchMode, ScopeType
+from models.enums import ActionType, MatchMode, ScopeType
+from models.schemas import ApplyResult, CellChange, Rule
 
-
-# --------------------------------------------------------------------------- #
-# Context & outcome
-# --------------------------------------------------------------------------- #
-
-@dataclass(frozen=True)
-class CellContext:
-    """Where a cell lives. All fields are required — the engine doesn't guess."""
-
-    sheet: str
-    column: str
-    raw_value: str          # always a string; the caller converts numerics out
-
-    @property
-    def normalized_value(self) -> str:
-        return normalize_value(self.raw_value)
+from .normalizer import normalize, to_text
+from .workbook_reader import LoadedWorkbook, is_formula_cell
 
 
-@dataclass(frozen=True)
-class RuleApplication:
-    """The outcome of applying a rule to a cell."""
+# --------------------------------------------------------------------- #
+# Precedence
+# --------------------------------------------------------------------- #
+_SCOPE_RANK = {
+    ScopeType.COLUMN:   0,
+    ScopeType.SHEET:    1,
+    ScopeType.WORKBOOK: 2,
+}
+_MATCH_RANK = {
+    MatchMode.EXACT_RAW:        0,
+    MatchMode.EXACT_NORMALIZED: 1,
+}
 
-    rule_id: str
-    source_value: str
-    target_value: str                    # the value to write (may be "")
-    action_type: ActionType
-    clear_cell: bool                     # True for SET_BLANK (write None)
+
+def _precedence_key(rule: Rule) -> tuple[int, int, int]:
+    return (
+        _SCOPE_RANK[rule.scope_type],
+        _MATCH_RANK[rule.match_mode],
+        rule.created_at,
+    )
 
 
-# --------------------------------------------------------------------------- #
-# Indexing
-# --------------------------------------------------------------------------- #
+def _rule_applies_to_location(rule: Rule, sheet: str, column: str) -> bool:
+    """True if the rule's scope covers the given (sheet, column)."""
+    if rule.scope_type is ScopeType.WORKBOOK:
+        return True
+    if rule.scope_type is ScopeType.SHEET:
+        return rule.scope_sheet == sheet
+    if rule.scope_type is ScopeType.COLUMN:
+        return rule.scope_sheet == sheet and rule.scope_column == column
+    return False
 
-class RuleIndex:
-    """Precomputed lookup tables over a rule set.
 
-    Indexing at construction time means the per-cell evaluation is O(1) on
-    the scope tier, regardless of rule-set size. For a workbook with
-    hundreds of thousands of cells, this matters.
-
-    The indices are keyed so that the same source value can appear under
-    different scopes and modes simultaneously without collision.
+def _rule_matches_value(rule: Rule, raw: str) -> bool:
     """
+    Whole-cell match check. Returns True if the cell value matches the
+    rule's source_value under the rule's match_mode.
+    """
+    if rule.match_mode is MatchMode.EXACT_RAW:
+        return raw == rule.source_value
+    if rule.match_mode is MatchMode.EXACT_NORMALIZED:
+        return normalize(raw) == normalize(rule.source_value)
+    return False
 
-    def __init__(self, rules: Iterable[CleaningRule]) -> None:
-        # Only enabled, valid rules enter the index.
-        self._rules: List[CleaningRule] = []
 
-        # Column-scoped: {(sheet, column, mode): {key: rule}}
-        self._column: Dict[Tuple[str, str, MatchMode], Dict[str, CleaningRule]] = {}
-        # Sheet-scoped: {(sheet, mode): {key: rule}}
-        self._sheet: Dict[Tuple[str, MatchMode], Dict[str, CleaningRule]] = {}
-        # Global: {mode: {key: rule}}
-        self._global: Dict[MatchMode, Dict[str, CleaningRule]] = {}
-
-        for rule in rules:
-            if not rule.enabled:
-                continue
-            if rule.validate():
-                # Invalid rules silently ignored — the UI validates before save.
-                continue
-            self._rules.append(rule)
-
-            key = self._key_for(rule)
-            if rule.scope_type == ScopeType.COLUMN:
-                assert rule.scope_sheet is not None and rule.scope_column is not None
-                bucket = self._column.setdefault(
-                    (rule.scope_sheet, rule.scope_column, rule.match_mode), {}
-                )
-            elif rule.scope_type == ScopeType.SHEET:
-                assert rule.scope_sheet is not None
-                bucket = self._sheet.setdefault(
-                    (rule.scope_sheet, rule.match_mode), {}
-                )
-            else:
-                bucket = self._global.setdefault(rule.match_mode, {})
-
-            # First rule wins on collision (input order is stable).
-            bucket.setdefault(key, rule)
-
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _key_for(rule: CleaningRule) -> str:
-        """The index key is whichever form the rule matches on."""
-        if rule.match_mode == MatchMode.EXACT_NORMALIZED:
-            return rule.normalized_source_value
-        return rule.source_value
-
-    # ------------------------------------------------------------------ #
-
-    def match(self, ctx: CellContext) -> Optional[CleaningRule]:
-        """Return the most-specific rule that applies, or None.
-
-        Priority order:
-          1. COLUMN + EXACT_RAW
-          2. COLUMN + EXACT_NORMALIZED
-          3. SHEET  + EXACT_RAW
-          4. SHEET  + EXACT_NORMALIZED
-          5. GLOBAL + EXACT_RAW
-          6. GLOBAL + EXACT_NORMALIZED
-
-        Within raw-mode tiers the lookup key is the cell's raw value; within
-        normalized-mode tiers it's the normalized form.
-        """
-        raw = ctx.raw_value
-        norm = ctx.normalized_value
-
-        # Column-scoped.
-        r = self._column.get((ctx.sheet, ctx.column, MatchMode.EXACT_RAW), {}).get(raw)
-        if r: return r
-        r = self._column.get((ctx.sheet, ctx.column, MatchMode.EXACT_NORMALIZED), {}).get(norm)
-        if r: return r
-
-        # Sheet-scoped.
-        r = self._sheet.get((ctx.sheet, MatchMode.EXACT_RAW), {}).get(raw)
-        if r: return r
-        r = self._sheet.get((ctx.sheet, MatchMode.EXACT_NORMALIZED), {}).get(norm)
-        if r: return r
-
-        # Global.
-        r = self._global.get(MatchMode.EXACT_RAW, {}).get(raw)
-        if r: return r
-        r = self._global.get(MatchMode.EXACT_NORMALIZED, {}).get(norm)
-        if r: return r
-
+def find_matching_rule(
+    rules: list[Rule],
+    sheet: str,
+    column: str,
+    raw: str,
+) -> Rule | None:
+    """
+    Return the single rule that wins precedence for this cell, or None.
+    """
+    candidates = [
+        r for r in rules
+        if r.enabled
+        and _rule_applies_to_location(r, sheet, column)
+        and _rule_matches_value(r, raw)
+    ]
+    if not candidates:
         return None
+    candidates.sort(key=_precedence_key)
+    return candidates[0]
 
-    # ------------------------------------------------------------------ #
 
-    def apply(self, ctx: CellContext) -> Optional[RuleApplication]:
-        """Match and resolve to a concrete write decision, or None."""
-        rule = self.match(ctx)
-        if rule is None:
-            return None
+# --------------------------------------------------------------------- #
+# Apply
+# --------------------------------------------------------------------- #
+def apply_rules(
+    loaded: LoadedWorkbook,
+    rules: Iterable[Rule],
+    *,
+    mutate_workbook: bool = True,
+    skip_formulas: bool = True,
+) -> ApplyResult:
+    """
+    Apply the ruleset.
 
-        if rule.action_type == ActionType.SET_BLANK:
-            return RuleApplication(
-                rule_id=rule.rule_id,
-                source_value=rule.source_value,
-                target_value="",
-                action_type=rule.action_type,
-                clear_cell=True,
-            )
+    If `mutate_workbook` is True, the underlying openpyxl Workbook is
+    edited in place so the exporter can write it back. The pandas
+    DataFrames are always updated so downstream stats reflect the change.
 
-        return RuleApplication(
-            rule_id=rule.rule_id,
-            source_value=rule.source_value,
-            target_value=rule.target_value,
-            action_type=rule.action_type,
-            clear_cell=False,
-        )
+    Returns an ApplyResult describing every change.
+    """
+    rule_list = list(rules)
+    result = ApplyResult()
 
-    # ------------------------------------------------------------------ #
+    for sheet_name, df in loaded.dataframes.items():
+        if df.empty:
+            continue
+        ws = loaded.wb[sheet_name] if mutate_workbook else None
 
-    @property
-    def active_rule_count(self) -> int:
-        return len(self._rules)
+        for col_index, col in enumerate(df.columns):
+            # A cheap filter: skip whole columns for which no enabled rule
+            # is in scope. For large workbooks this matters.
+            col_rules = [
+                r for r in rule_list
+                if r.enabled and _rule_applies_to_location(r, sheet_name, col)
+            ]
+            if not col_rules:
+                continue
+
+            for row_index, value in enumerate(df[col]):
+                raw = "" if value is None else to_text(value)
+
+                rule = find_matching_rule(col_rules, sheet_name, col, raw)
+                if rule is None:
+                    continue
+
+                # Determine the target value
+                if rule.action_type is ActionType.SET_BLANK:
+                    new_value: object = ""
+                elif rule.action_type is ActionType.REPLACE:
+                    new_value = rule.target_value
+                else:
+                    continue
+
+                if new_value == raw:
+                    continue  # no-op
+
+                # openpyxl cell: row 1 is header, data starts row 2
+                if ws is not None:
+                    cell = ws.cell(row=row_index + 2, column=col_index + 1)
+                    if skip_formulas and is_formula_cell(cell):
+                        continue   # don't disturb formulas
+                    cell.value = new_value if new_value != "" else None
+
+                # Always update the DataFrame so stats see the change.
+                # Cast column to object first if the new value's type doesn't
+                # match — pandas otherwise raises on int64-to-str writes.
+                new_cell = new_value if new_value != "" else None
+                col_name = df.columns[col_index]
+                try:
+                    df.iat[row_index, col_index] = new_cell
+                except (TypeError, ValueError):
+                    df[col_name] = df[col_name].astype(object)
+                    df.iat[row_index, col_index] = new_cell
+
+                result.changes.append(CellChange(
+                    sheet=sheet_name,
+                    row=row_index + 2,
+                    column=col,
+                    before=value,
+                    after=new_value,
+                    rule_id=rule.rule_id,
+                ))
+                result.fires_per_rule[rule.rule_id] = result.fires_per_rule.get(rule.rule_id, 0) + 1
+                result.affected_sheets.add(sheet_name)
+                result.affected_columns.add(f"{sheet_name}::{col}")
+
+    return result

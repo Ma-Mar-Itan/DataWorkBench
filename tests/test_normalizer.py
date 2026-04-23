@@ -1,71 +1,96 @@
-"""Tests for value normalization."""
-
+"""Tests for the Arabic-safe normalizer."""
 from __future__ import annotations
 
-from core.normalizer import is_blank, normalize_value, trim_and_collapse
+import pytest
+
+from core.normalizer import (
+    MISSING_TOKENS, is_arabic, is_missing_token, normalize, to_text,
+)
 
 
-def test_normalize_lowercases() -> None:
-    assert normalize_value("MALE") == "male"
+class TestNormalizeBasics:
+    def test_empty(self):
+        assert normalize("") == ""
+        assert normalize(None) == ""
+
+    def test_none_becomes_empty(self):
+        assert normalize(None) == ""
+
+    def test_latin_casefold(self):
+        assert normalize("Yes") == "yes"
+        assert normalize("YES") == "yes"
+        assert normalize("yes") == "yes"
+
+    def test_whitespace_collapsed(self):
+        assert normalize("  hello   world  ") == "hello world"
+        assert normalize("foo\tbar") == "foo bar"
+        assert normalize("foo\n\nbar") == "foo bar"
+
+    def test_integer_stringified(self):
+        assert normalize(42) == "42"
+
+    def test_casefold_handles_eszett(self):
+        # German ß -> ss under casefold (more correct than .lower())
+        assert normalize("STRAẞE") == "strasse"
 
 
-def test_normalize_collapses_whitespace() -> None:
-    assert normalize_value("  Very   good  ") == "very good"
+class TestNormalizeArabic:
+    def test_arabic_preserved(self):
+        assert normalize("ذكر") == "ذكر"
+        assert normalize("أنثى") == "أنثى"
+
+    def test_tatweel_removed(self):
+        # tatweel is purely decorative; "أســعد" -> "أسعد"
+        assert normalize("أســـــعد") == "أسعد"
+
+    def test_arabic_whitespace_collapsed(self):
+        assert normalize("  مرحبا   بك  ") == "مرحبا بك"
+
+    def test_arabic_not_folded(self):
+        # We do NOT merge ا/أ/إ. These remain distinct under normalize.
+        assert normalize("احمد") != normalize("أحمد")
+        assert normalize("ى") != normalize("ي")
+
+    def test_arabic_presentation_forms_nfkc(self):
+        # NFKC folds presentation forms to base forms (this is safe,
+        # since presentation forms are display-only variants)
+        # U+FE8E is "ARABIC LETTER ALEF FINAL FORM" → folds to U+0627
+        assert "\u0627" in normalize("\ufe8e")
 
 
-def test_normalize_casefolds() -> None:
-    # casefold handles German eszett; "ß" → "ss".
-    assert normalize_value("Straße") == "strasse"
+class TestIsArabic:
+    def test_english_not_arabic(self):
+        assert not is_arabic("hello")
+
+    def test_arabic_detected(self):
+        assert is_arabic("ذكر")
+
+    def test_mixed_counts_as_arabic(self):
+        assert is_arabic("User: أحمد")
 
 
-def test_normalize_strips_tatweel() -> None:
-    assert normalize_value("ن\u0640\u0640سبة") == normalize_value("نسبة")
+class TestMissingTokens:
+    @pytest.mark.parametrize("token", ["N/A", "n/a", "  N/A  ", "NA", "-", ".", "MISSING", "unknown", "null", ""])
+    def test_common_missing(self, token):
+        assert is_missing_token(token), f"expected {token!r} to be detected as missing"
+
+    def test_arabic_missing(self):
+        assert is_missing_token("لا يوجد")
+        assert is_missing_token("غير معروف")
+
+    def test_real_value_not_missing(self):
+        assert not is_missing_token("Yes")
+        assert not is_missing_token("0")          # zero is real data
+        assert not is_missing_token("أحمد")
 
 
-def test_whitespace_variants_match() -> None:
-    a = normalize_value(" Male ")
-    b = normalize_value("male")
-    c = normalize_value("MALE")
-    d = normalize_value("male\t")
-    assert a == b == c == d == "male"
+class TestToText:
+    def test_none(self):
+        assert to_text(None) == ""
 
+    def test_number(self):
+        assert to_text(42) == "42"
+        assert to_text(3.14) == "3.14"
 
-def test_normalize_non_string_returns_empty() -> None:
-    assert normalize_value(None) == ""
-    assert normalize_value(123) == ""
-    assert normalize_value(True) == ""
-
-
-def test_normalize_empty_returns_empty() -> None:
-    assert normalize_value("") == ""
-
-
-def test_normalize_preserves_arabic_letter_variants() -> None:
-    # Different alef letters must not fold together.
-    a = normalize_value("أحمد")
-    b = normalize_value("احمد")
-    assert a != b
-
-
-def test_normalize_preserves_punctuation_boundary() -> None:
-    # "N/A" and "N.A." must stay distinct — the user can write rules
-    # against both if needed.
-    assert normalize_value("N/A") != normalize_value("N.A.")
-
-
-def test_normalize_preserves_leading_zeros() -> None:
-    # ID codes often look like "01", "001" — we must not strip the zeros.
-    assert normalize_value("01") == "01"
-    assert normalize_value("01") != normalize_value("1")
-
-
-def test_trim_and_collapse_preserves_case() -> None:
-    assert trim_and_collapse("  Hello  World  ") == "Hello World"
-
-
-def test_is_blank_recognises_whitespace() -> None:
-    assert is_blank("") is True
-    assert is_blank("   ") is True
-    assert is_blank(None) is True
-    assert is_blank("x") is False
-    assert is_blank(0) is False  # numbers aren't "blank text"
+    def test_string_passthrough(self):
+        assert to_text("  spaces  ") == "  spaces  "     # untouched

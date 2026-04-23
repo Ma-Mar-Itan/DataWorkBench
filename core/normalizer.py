@@ -1,85 +1,117 @@
 """
-Value normalization.
+Arabic-safe conservative normalizer.
 
-Used in two places:
+Design intent:
+  * Normalization is for *matching* only — it never rewrites the user's
+    data. The raw value is always preserved; we just derive a canonical
+    form so "Male", "male ", and "MALE" collide under `exact_normalized`.
+  * Arabic is treated with minimal changes: NFKC, tatweel removal, and
+    whitespace cleanup. No diacritic stripping, no letter folding (no
+    ا/أ/إ merging, no ي/ى merging, no ة/ه merging). Those are opinionated
+    transformations that can silently change meaning, and this app
+    defaults to safety over aggressiveness.
+  * Latin text is casefolded so "YES" == "yes" == "Yes".
+  * We never do substring work. That is a property of the rules engine,
+    not the normalizer, but the normalizer is designed so the normalized
+    form is a full-cell canonical value, not a token sequence.
 
-1.  **Scanning.** When the extractor builds the unique-value registry, it
-    groups values by their normalized form. Two cells holding " Male " and
-    "male" collapse into one ExtractedValue with frequency 2.
-
-2.  **Matching.** The exporter's EXACT_NORMALIZED match mode compares the
-    cell's normalized value against the rule's ``normalized_source_value``.
-
-Normalization steps (in order)
-------------------------------
-1. NFKC Unicode normalization — folds compatibility forms, full-width
-   digits, composes decomposed characters.
-2. Tatweel (U+0640) removal — purely cosmetic Arabic elongation.
-3. Whitespace collapse — every run of Unicode whitespace becomes a single
-   ASCII space, with leading/trailing spaces trimmed.
-4. Lowercase (``casefold``) — case-insensitive matching for Latin text;
-   harmless for Arabic since Arabic has no case.
-
-What we deliberately do **not** do
-----------------------------------
-- Strip punctuation. "N/A" and "N.A." stay distinct unless the user writes
-  rules for both. Folding them would risk collapsing codes that mean
-  different things (e.g. "1.0" vs "1/0").
-- Fold Arabic letter variants (alef forms, ya vs alef maqsura). In
-  statistical vocabulary these distinctions can be meaningful.
-- Strip leading zeros ("01" vs "1"). Often semantically meaningful in ID
-  codes and survey answer keys.
-
-The user who wants any of those collapsed can write a rule that maps both
-forms to the canonical one.
+If a future mode wants more aggressive folding, add it as an explicit
+match_mode variant; do not change the default.
 """
-
 from __future__ import annotations
 
 import re
 import unicodedata
+from typing import Any
 
-
+# U+0640 ARABIC TATWEEL — purely decorative, safe to strip
 _TATWEEL = "\u0640"
-_WHITESPACE_RUN = re.compile(r"\s+", re.UNICODE)
+
+# Collapse runs of any Unicode whitespace to a single space
+_WS_RUN = re.compile(r"\s+")
+
+# Arabic Unicode block range (for is_arabic)
+# 0600-06FF: Arabic, 0750-077F: Arabic Supplement, FB50-FDFF and FE70-FEFF: presentation forms
+_ARABIC_RE = re.compile(r"[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
 
 
-def normalize_value(value: object) -> str:
-    """Return the normalized form of ``value`` suitable for grouping/matching.
+def is_arabic(s: str) -> bool:
+    """True if the string contains at least one Arabic-script character."""
+    return bool(_ARABIC_RE.search(s))
 
-    Non-strings return an empty string. The exporter never matches non-string
-    cells, so this coercion is safe.
+
+def to_text(value: Any) -> str:
     """
-    if not isinstance(value, str):
-        return ""
-    if not value:
-        return ""
-    text = unicodedata.normalize("NFKC", value)
-    if _TATWEEL in text:
-        text = text.replace(_TATWEEL, "")
-    text = _WHITESPACE_RUN.sub(" ", text).strip()
-    return text.casefold()
+    Coerce any cell value to a string for normalization/display purposes.
 
-
-def trim_and_collapse(value: str) -> str:
-    """Lighter normalization: whitespace only, no case change.
-
-    Useful where we need to present cleaned-up display text but mustn't
-    alter the user's casing. Currently used by the extractor when recording
-    a value's representative ``raw_value``.
+    Returns '' for None. Does NOT convert numeric zero to blank — 0 stays
+    as '0'. Booleans become 'True'/'False' (preserved case; not commonly
+    needed for scan but kept consistent with str()).
     """
-    if not isinstance(value, str) or not value:
-        return ""
-    text = unicodedata.normalize("NFKC", value)
-    if _TATWEEL in text:
-        text = text.replace(_TATWEEL, "")
-    return _WHITESPACE_RUN.sub(" ", text).strip()
-
-
-def is_blank(value: object) -> bool:
-    """True if the value is None, an empty string, or whitespace-only."""
     if value is None:
-        return True
-    if not isinstance(value, str):
-        return False
-    return value.strip() == ""
+        return ""
+    if isinstance(value, str):
+        return value
+    return str(value)
+
+
+def normalize(value: Any) -> str:
+    """
+    Produce the canonical form used by `exact_normalized` matching.
+
+    Steps, in order:
+      1. Coerce to string.
+      2. Unicode NFKC — merges compatibility forms (e.g. Arabic presentation
+         forms → base letters, fullwidth Latin → ASCII).
+      3. Strip tatweel.
+      4. Collapse any whitespace runs to a single ASCII space.
+      5. Trim leading/trailing whitespace.
+      6. Casefold — Unicode-aware lowercasing for Latin; a no-op for Arabic.
+
+    Empty string in → empty string out.
+    """
+    s = to_text(value)
+    if s == "":
+        return ""
+
+    s = unicodedata.normalize("NFKC", s)
+    s = s.replace(_TATWEEL, "")
+    s = _WS_RUN.sub(" ", s)
+    s = s.strip()
+    # casefold is safe on Arabic (it's identity there) and handles Latin,
+    # German ß, Greek, etc. more correctly than .lower()
+    s = s.casefold()
+    return s
+
+
+# --------------------------------------------------------------------- #
+# Missing-token detection
+# --------------------------------------------------------------------- #
+# These are *normalized* forms. The scanner compares normalize(cell) to
+# this set to flag likely missing values.
+MISSING_TOKENS: frozenset[str] = frozenset({
+    "",
+    "n/a",
+    "na",
+    "n.a.",
+    "n/a.",
+    "-",
+    "--",
+    ".",
+    "..",
+    "missing",
+    "null",
+    "none",
+    "nil",
+    "unknown",
+    "tbd",
+    "#n/a",
+    "لا يوجد",    # "no value" in Arabic
+    "غير معروف",   # "unknown" in Arabic
+})
+
+
+def is_missing_token(value: Any) -> bool:
+    """True if the normalized value matches a known missing token."""
+    n = normalize(value)
+    return n in MISSING_TOKENS

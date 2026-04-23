@@ -1,115 +1,117 @@
 """
-Rule-set storage.
+Ruleset persistence.
 
-Reusable cleaning recipes are persisted to a directory as individual JSON
-files. One file per rule set keeps the blast radius of a corrupt save
-minimal — a broken set doesn't take the rest down with it.
+Rulesets are stored as JSON. The schema is versioned (schema_version: 1)
+so the loader can migrate older formats if needed.
 
-File naming
------------
-``{slug}.json`` where slug is a filesystem-safe transform of the set name.
-The in-memory ``RuleSet.name`` is authoritative — the slug is cosmetic.
+A loaded ruleset is always validated — any malformed rule is rejected
+with a clear error rather than silently dropped, because silently
+dropping a rule can change cleaning output in ways the user won't
+notice.
 """
-
 from __future__ import annotations
 
 import json
-import re
-from pathlib import Path
-from typing import List
+from typing import Any, Iterable
 
-from models.schemas import RuleSet
-
-
-DEFAULT_RULESET_DIR = Path("rulesets")
+from models.enums import ActionType, MatchMode, ScopeType
+from models.schemas import Rule
 
 
-# --------------------------------------------------------------------------- #
-
-def _slugify(name: str) -> str:
-    """Turn a human name into a safe filename stem."""
-    s = re.sub(r"[^\w\-. ]+", "", name, flags=re.UNICODE).strip()
-    s = re.sub(r"\s+", "_", s)
-    return (s or "ruleset").lower()
+SCHEMA_VERSION = 1
 
 
-# --------------------------------------------------------------------------- #
+class RulesetValidationError(ValueError):
+    """Raised when a ruleset JSON blob fails schema validation."""
 
-class RuleSetStore:
-    """Directory-backed store. One file per rule set."""
 
-    def __init__(self, directory: Path = DEFAULT_RULESET_DIR) -> None:
-        self.directory = Path(directory)
+# --------------------------------------------------------------------- #
+# Save
+# --------------------------------------------------------------------- #
+def save_ruleset(rules: Iterable[Rule], metadata: dict | None = None) -> str:
+    """Serialize a ruleset to a JSON string."""
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "metadata":       metadata or {},
+        "rules":          [r.to_dict() for r in rules],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
-    # ------------------------------------------------------------------ #
 
-    def list_names(self) -> List[str]:
-        """Return the names of all stored rule sets, alphabetically sorted.
+def save_ruleset_to_file(path: str, rules: Iterable[Rule], metadata: dict | None = None) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(save_ruleset(rules, metadata))
 
-        Reads each file to recover the canonical ``name`` — we don't rely on
-        the slug because names are mutable but slugs are committed filenames.
-        """
-        if not self.directory.exists():
-            return []
-        names: List[str] = []
-        for path in sorted(self.directory.glob("*.json")):
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                name = data.get("name")
-                if isinstance(name, str) and name:
-                    names.append(name)
-            except (OSError, json.JSONDecodeError):
-                continue
-        return sorted(set(names))
 
-    # ------------------------------------------------------------------ #
+# --------------------------------------------------------------------- #
+# Load
+# --------------------------------------------------------------------- #
+def load_ruleset(blob: str | bytes) -> tuple[list[Rule], dict]:
+    """
+    Parse and validate a JSON ruleset.
 
-    def _path_for_name(self, name: str) -> Path:
-        """Return the filepath associated with a rule-set name.
+    Returns (rules, metadata). Raises RulesetValidationError on any
+    schema problem.
+    """
+    if isinstance(blob, bytes):
+        blob = blob.decode("utf-8")
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError as e:
+        raise RulesetValidationError(f"Invalid JSON: {e}") from e
 
-        We scan the directory to honour any existing file whose *content*
-        has this name, even if the filename was hand-edited. Falls back to
-        the slug-based path for new writes.
-        """
-        if self.directory.exists():
-            for path in self.directory.glob("*.json"):
-                try:
-                    with path.open("r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    if data.get("name") == name:
-                        return path
-                except (OSError, json.JSONDecodeError):
-                    continue
-        return self.directory / f"{_slugify(name)}.json"
+    _validate_payload(data)
+    rules = [_validate_rule(r, i) for i, r in enumerate(data["rules"])]
+    metadata = data.get("metadata", {})
+    return rules, metadata
 
-    # ------------------------------------------------------------------ #
 
-    def load(self, name: str) -> RuleSet:
-        """Load and deserialize a named rule set. Raises on missing/malformed."""
-        path = self._path_for_name(name)
-        if not path.exists():
-            raise FileNotFoundError(f"Rule set {name!r} not found at {path}.")
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return RuleSet.from_dict(data)
+def load_ruleset_from_file(path: str) -> tuple[list[Rule], dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        return load_ruleset(f.read())
 
-    # ------------------------------------------------------------------ #
 
-    def save(self, ruleset: RuleSet) -> Path:
-        """Persist a rule set. Returns the file path written."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self._path_for_name(ruleset.name)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(ruleset.to_dict(), f, ensure_ascii=False, indent=2)
-        return path
+# --------------------------------------------------------------------- #
+# Validation internals
+# --------------------------------------------------------------------- #
+def _validate_payload(data: Any) -> None:
+    if not isinstance(data, dict):
+        raise RulesetValidationError("Top-level JSON must be an object.")
+    if "rules" not in data or not isinstance(data["rules"], list):
+        raise RulesetValidationError("Missing or malformed 'rules' array.")
+    version = data.get("schema_version", 1)
+    if version != SCHEMA_VERSION:
+        raise RulesetValidationError(
+            f"Unsupported schema_version {version}. Expected {SCHEMA_VERSION}."
+        )
 
-    # ------------------------------------------------------------------ #
 
-    def delete(self, name: str) -> bool:
-        """Remove a stored rule set. Returns True if something was deleted."""
-        path = self._path_for_name(name)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+_VALID_SCOPES  = {s.value for s in ScopeType}
+_VALID_MATCH   = {m.value for m in MatchMode}
+_VALID_ACTIONS = {a.value for a in ActionType}
+
+
+def _validate_rule(r: Any, idx: int) -> Rule:
+    if not isinstance(r, dict):
+        raise RulesetValidationError(f"Rule at index {idx} is not an object.")
+    required = ("rule_id", "source_value")
+    for k in required:
+        if k not in r:
+            raise RulesetValidationError(f"Rule at index {idx} missing '{k}'.")
+
+    scope  = r.get("scope_type",  ScopeType.WORKBOOK.value)
+    match  = r.get("match_mode",  MatchMode.EXACT_NORMALIZED.value)
+    action = r.get("action_type", ActionType.REPLACE.value)
+    if scope  not in _VALID_SCOPES:  raise RulesetValidationError(f"Rule '{r['rule_id']}': bad scope_type '{scope}'.")
+    if match  not in _VALID_MATCH:   raise RulesetValidationError(f"Rule '{r['rule_id']}': bad match_mode '{match}'.")
+    if action not in _VALID_ACTIONS: raise RulesetValidationError(f"Rule '{r['rule_id']}': bad action_type '{action}'.")
+
+    if scope == ScopeType.SHEET.value and not r.get("scope_sheet"):
+        raise RulesetValidationError(f"Rule '{r['rule_id']}': sheet scope requires scope_sheet.")
+    if scope == ScopeType.COLUMN.value and (not r.get("scope_sheet") or not r.get("scope_column")):
+        raise RulesetValidationError(f"Rule '{r['rule_id']}': column scope requires scope_sheet and scope_column.")
+
+    try:
+        return Rule.from_dict(r)
+    except Exception as e:
+        raise RulesetValidationError(f"Rule '{r.get('rule_id', idx)}': {e}") from e

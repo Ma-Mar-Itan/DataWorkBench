@@ -1,248 +1,226 @@
-"""
-Rule engine tests — scope priority, match modes, invariants.
+"""Tests for the rule engine.
 
-The single most important test in this file is
-``test_no_substring_leak``, which proves the whole-cell-match invariant:
-a rule mapping a short value cannot touch a cell whose value *contains*
-that short value as a substring.
+The core invariants this file protects:
+  1. Matching is whole-cell. `Home` must not touch `Homework`. This is
+     THE NON-NEGOTIABLE RULE of the product.
+  2. Scopes apply correctly. Workbook/sheet/column scopes must restrict
+     rules exactly as described.
+  3. Precedence: column > sheet > workbook; raw > normalized; earlier
+     creation wins final tie.
+  4. Formulas are skipped by default.
 """
-
 from __future__ import annotations
 
-from core.rules_engine import CellContext, RuleIndex
-from models.schemas import ActionType, CleaningRule, MatchMode, ScopeType
+from core.rules_engine import apply_rules, find_matching_rule
+from core.workbook_reader import load_workbook_from_bytes
+from models.enums import ActionType, MatchMode, ScopeType
+from models.schemas import Rule
+
+from ._helpers import make_test_workbook
 
 
-# --------------------------------------------------------------------------- #
-# Safety invariant — MOST IMPORTANT TEST IN THE SUITE.
-# --------------------------------------------------------------------------- #
-
-def test_no_substring_leak() -> None:
-    """Rule source 'male' must NOT match a cell whose value is 'male student'."""
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            match_mode=MatchMode.EXACT_NORMALIZED,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    # The cell contains "male" as a prefix — classic substring-leak scenario.
-    app = index.apply(CellContext(sheet="S", column="Note", raw_value="male student"))
-    assert app is None, "Substring match leaked through the engine"
+def _loaded(sheets):
+    return load_workbook_from_bytes(make_test_workbook(sheets), filename="t.xlsx")
 
 
-def test_no_substring_leak_with_raw_mode() -> None:
-    """Same invariant under EXACT_RAW mode."""
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            match_mode=MatchMode.EXACT_RAW,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    app = index.apply(CellContext(sheet="S", column="Note", raw_value="male student"))
-    assert app is None
-
-
-# --------------------------------------------------------------------------- #
-# Match modes
-# --------------------------------------------------------------------------- #
-
-def test_exact_raw_matches_only_exact_bytes() -> None:
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            match_mode=MatchMode.EXACT_RAW,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    assert index.apply(CellContext("S", "C", "male")) is not None
-    # Different case → no match under raw mode.
-    assert index.apply(CellContext("S", "C", "Male")) is None
-    # Extra whitespace → no match under raw mode.
-    assert index.apply(CellContext("S", "C", " male ")) is None
-
-
-def test_exact_normalized_matches_case_and_whitespace_variants() -> None:
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            match_mode=MatchMode.EXACT_NORMALIZED,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    for variant in ("male", "Male", "MALE", "  male  ", "\tmale\n"):
-        app = index.apply(CellContext("S", "C", variant))
-        assert app is not None, f"Variant {variant!r} should have matched"
-        assert app.target_value == "1"
-
-
-# --------------------------------------------------------------------------- #
-# Scope priority — column > sheet > global
-# --------------------------------------------------------------------------- #
-
-def test_column_scope_wins_over_global() -> None:
-    """A column-scoped rule for the same value should override a global one."""
-    rules = [
-        CleaningRule(
-            source_value="1",
-            target_value="global_hit",
-            scope_type=ScopeType.GLOBAL,
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-        CleaningRule(
-            source_value="1",
-            target_value="column_hit",
-            scope_type=ScopeType.COLUMN,
-            scope_sheet="Survey",
-            scope_column="Gender",
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-    ]
-    index = RuleIndex(rules)
-    app = index.apply(CellContext("Survey", "Gender", "1"))
-    assert app is not None
-    assert app.target_value == "column_hit"
-
-
-def test_sheet_scope_wins_over_global() -> None:
-    rules = [
-        CleaningRule(
-            source_value="x",
-            target_value="global",
-            scope_type=ScopeType.GLOBAL,
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-        CleaningRule(
-            source_value="x",
-            target_value="sheet",
-            scope_type=ScopeType.SHEET,
-            scope_sheet="Survey",
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-    ]
-    index = RuleIndex(rules)
-    app = index.apply(CellContext("Survey", "A", "x"))
-    assert app is not None
-    assert app.target_value == "sheet"
-
-
-def test_sheet_scope_does_not_leak_to_other_sheets() -> None:
-    rules = [
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            scope_type=ScopeType.SHEET,
-            scope_sheet="A",
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-    ]
-    index = RuleIndex(rules)
-    assert index.apply(CellContext("A", "X", "male")) is not None
-    assert index.apply(CellContext("B", "X", "male")) is None
-
-
-def test_column_scope_does_not_leak_to_other_columns() -> None:
-    rules = [
-        CleaningRule(
-            source_value="1",
-            target_value="hit",
-            scope_type=ScopeType.COLUMN,
-            scope_sheet="S",
-            scope_column="Gender",
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-    ]
-    index = RuleIndex(rules)
-    assert index.apply(CellContext("S", "Gender", "1")) is not None
-    assert index.apply(CellContext("S", "Response", "1")) is None
-
-
-def test_raw_wins_over_normalized_at_same_scope() -> None:
-    """If both match, EXACT_RAW at the same scope tier takes priority."""
-    rules = [
-        CleaningRule(
-            source_value="Male",
-            target_value="raw_hit",
-            scope_type=ScopeType.GLOBAL,
-            match_mode=MatchMode.EXACT_RAW,
-        ),
-        CleaningRule(
-            source_value="male",
-            target_value="norm_hit",
-            scope_type=ScopeType.GLOBAL,
-            match_mode=MatchMode.EXACT_NORMALIZED,
-        ),
-    ]
-    index = RuleIndex(rules)
-    app = index.apply(CellContext("S", "C", "Male"))
-    assert app is not None
-    assert app.target_value == "raw_hit"
-
-
-# --------------------------------------------------------------------------- #
-# Disabled / invalid rules
-# --------------------------------------------------------------------------- #
-
-def test_disabled_rules_are_ignored() -> None:
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            scope_type=ScopeType.GLOBAL,
-            match_mode=MatchMode.EXACT_RAW,
-            enabled=False,
-        ),
-    ])
-    assert index.apply(CellContext("S", "C", "male")) is None
-
-
-def test_invalid_rules_are_ignored() -> None:
-    # An empty source is invalid. The index must silently drop it
-    # rather than crash or match everything.
-    bad = CleaningRule(
+def _rule(**kw) -> Rule:
+    defaults = dict(
+        rule_id="r1",
         source_value="",
-        target_value="x",
-        scope_type=ScopeType.GLOBAL,
+        target_value="",
+        action_type=ActionType.REPLACE,
+        match_mode=MatchMode.EXACT_NORMALIZED,
+        scope_type=ScopeType.WORKBOOK,
+        scope_sheet="",
+        scope_column="",
+        enabled=True,
+        created_at=0,
     )
-    index = RuleIndex([bad])
-    assert index.active_rule_count == 0
-    assert index.apply(CellContext("S", "C", "anything")) is None
+    defaults.update(kw)
+    return Rule(**defaults)
 
 
-# --------------------------------------------------------------------------- #
-# Actions
-# --------------------------------------------------------------------------- #
+# ===================================================================== #
+# WHOLE-CELL MATCHING — the critical invariant
+# ===================================================================== #
+class TestWholeCellMatching:
+    def test_home_does_not_affect_homework(self):
+        """The flagship test. If this ever fails, the product is broken."""
+        wb = _loaded({"S": [["c"], ["Home"], ["Homework"], ["Home office"]]})
+        rules = [_rule(source_value="Home", target_value="House",
+                       match_mode=MatchMode.EXACT_RAW)]
+        result = apply_rules(wb, rules)
 
-def test_set_blank_action_marks_cell_for_clear() -> None:
-    index = RuleIndex([
-        CleaningRule(
-            source_value="N/A",
-            action_type=ActionType.SET_BLANK,
-            match_mode=MatchMode.EXACT_NORMALIZED,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    app = index.apply(CellContext("S", "C", "n/a"))
-    assert app is not None
-    assert app.clear_cell is True
+        # Only the exact-match "Home" should change
+        assert len(result.changes) == 1
+        assert result.changes[0].before == "Home"
+        assert result.changes[0].after == "House"
+
+        df = wb.dataframes["S"]
+        assert df["c"].tolist() == ["House", "Homework", "Home office"]
+
+    def test_male_matches_only_whole_cell(self):
+        wb = _loaded({"S": [["c"], ["Male"], ["Female"], ["male nurse"], ["Maleficent"]]})
+        rules = [_rule(source_value="Male", target_value="M",
+                       match_mode=MatchMode.EXACT_NORMALIZED)]
+        result = apply_rules(wb, rules)
+        # "Male" (normalized "male") matches. "male nurse" and
+        # "Maleficent" do not. "Female" normalized is "female" (not "male").
+        assert {c.before for c in result.changes} == {"Male"}
+        assert len(result.changes) == 1
+
+    def test_arabic_short_does_not_affect_longer_phrase(self):
+        # Replacing "ذكر" should not touch the longer phrase "ذكر أحمد شيئا"
+        wb = _loaded({"S": [["c"], ["ذكر"], ["ذكر أحمد شيئا"], ["الذكر"]]})
+        rules = [_rule(source_value="ذكر", target_value="M",
+                       match_mode=MatchMode.EXACT_RAW)]
+        result = apply_rules(wb, rules)
+        assert len(result.changes) == 1
+        assert result.changes[0].before == "ذكر"
+
+        df = wb.dataframes["S"]
+        assert df["c"].tolist() == ["M", "ذكر أحمد شيئا", "الذكر"]
+
+    def test_normalized_matches_whitespace_and_case_variants(self):
+        wb = _loaded({"S": [["c"], ["  yes  "], ["YES"], ["Yes"], ["yes nope"]]})
+        rules = [_rule(source_value="yes", target_value="Yes",
+                       match_mode=MatchMode.EXACT_NORMALIZED)]
+        result = apply_rules(wb, rules)
+        # Matches: "  yes  " → "Yes" (changed) and "YES" → "Yes" (changed).
+        # "Yes" already equals "Yes" — engine correctly skips the no-op.
+        # "yes nope" does not match (whole-cell).
+        assert len(result.changes) == 2
+        df = wb.dataframes["S"]
+        assert df["c"].tolist() == ["Yes", "Yes", "Yes", "yes nope"]
 
 
-def test_map_code_treated_as_replace_for_write_semantics() -> None:
-    index = RuleIndex([
-        CleaningRule(
-            source_value="male",
-            target_value="1",
-            action_type=ActionType.MAP_CODE,
-            match_mode=MatchMode.EXACT_NORMALIZED,
-            scope_type=ScopeType.GLOBAL,
-        ),
-    ])
-    app = index.apply(CellContext("S", "C", "Male"))
-    assert app is not None
-    assert app.clear_cell is False
-    assert app.target_value == "1"
+# ===================================================================== #
+# SCOPE
+# ===================================================================== #
+class TestScope:
+    def test_workbook_scope_hits_all_sheets(self):
+        wb = _loaded({
+            "A": [["c"], ["N/A"], ["ok"]],
+            "B": [["c"], ["N/A"], ["ok"]],
+        })
+        rules = [_rule(source_value="N/A", action_type=ActionType.SET_BLANK,
+                       scope_type=ScopeType.WORKBOOK)]
+        result = apply_rules(wb, rules)
+        assert result.affected_sheets == {"A", "B"}
+        assert result.changed_cells == 2
+
+    def test_sheet_scope_limits_to_one_sheet(self):
+        wb = _loaded({
+            "A": [["c"], ["x"]],
+            "B": [["c"], ["x"]],
+        })
+        rules = [_rule(source_value="x", target_value="Y",
+                       scope_type=ScopeType.SHEET, scope_sheet="A",
+                       match_mode=MatchMode.EXACT_RAW)]
+        result = apply_rules(wb, rules)
+        assert result.affected_sheets == {"A"}
+        assert wb.dataframes["A"]["c"].tolist() == ["Y"]
+        assert wb.dataframes["B"]["c"].tolist() == ["x"]
+
+    def test_column_scope_limits_to_one_column(self):
+        wb = _loaded({"S": [["c1", "c2"], ["x", "x"], ["x", "x"]]})
+        rules = [_rule(source_value="x", target_value="Y",
+                       scope_type=ScopeType.COLUMN,
+                       scope_sheet="S", scope_column="c1",
+                       match_mode=MatchMode.EXACT_RAW)]
+        result = apply_rules(wb, rules)
+        df = wb.dataframes["S"]
+        assert df["c1"].tolist() == ["Y", "Y"]
+        assert df["c2"].tolist() == ["x", "x"]
+
+
+# ===================================================================== #
+# PRECEDENCE
+# ===================================================================== #
+class TestPrecedence:
+    def test_column_scope_beats_workbook(self):
+        wb = _loaded({"S": [["c"], ["x"]]})
+        wb_rule  = _rule(rule_id="w", source_value="x", target_value="WORK",
+                         match_mode=MatchMode.EXACT_RAW,
+                         scope_type=ScopeType.WORKBOOK, created_at=1)
+        col_rule = _rule(rule_id="c", source_value="x", target_value="COL",
+                         match_mode=MatchMode.EXACT_RAW,
+                         scope_type=ScopeType.COLUMN, scope_sheet="S",
+                         scope_column="c", created_at=2)
+        result = apply_rules(wb, [wb_rule, col_rule])
+        assert wb.dataframes["S"]["c"].tolist() == ["COL"]
+        assert result.changes[0].rule_id == "c"
+
+    def test_raw_beats_normalized_at_same_scope(self):
+        wb = _loaded({"S": [["c"], ["x"]]})
+        raw  = _rule(rule_id="raw", source_value="x", target_value="RAW",
+                     match_mode=MatchMode.EXACT_RAW, created_at=2)
+        norm = _rule(rule_id="norm", source_value="x", target_value="NORM",
+                     match_mode=MatchMode.EXACT_NORMALIZED, created_at=1)
+        apply_rules(wb, [raw, norm])
+        assert wb.dataframes["S"]["c"].tolist() == ["RAW"]
+
+    def test_earlier_created_wins_final_tie(self):
+        wb = _loaded({"S": [["c"], ["x"]]})
+        a = _rule(rule_id="a", source_value="x", target_value="A",
+                  match_mode=MatchMode.EXACT_RAW, created_at=1)
+        b = _rule(rule_id="b", source_value="x", target_value="B",
+                  match_mode=MatchMode.EXACT_RAW, created_at=2)
+        apply_rules(wb, [b, a])   # order in list shouldn't matter
+        assert wb.dataframes["S"]["c"].tolist() == ["A"]
+
+
+# ===================================================================== #
+# ENABLED / NO-OP / FORMULAS
+# ===================================================================== #
+class TestMisc:
+    def test_disabled_rule_does_nothing(self):
+        wb = _loaded({"S": [["c"], ["x"]]})
+        rules = [_rule(source_value="x", target_value="Y",
+                       match_mode=MatchMode.EXACT_RAW, enabled=False)]
+        result = apply_rules(wb, rules)
+        assert result.changed_cells == 0
+
+    def test_set_blank_action(self):
+        import pandas as pd
+        wb = _loaded({"S": [["c"], ["N/A"]]})
+        rules = [_rule(source_value="N/A",
+                       action_type=ActionType.SET_BLANK,
+                       match_mode=MatchMode.EXACT_RAW)]
+        apply_rules(wb, rules)
+        # pandas may represent a blanked cell as None or NaN depending on dtype;
+        # either is a valid "missing" marker.
+        val = wb.dataframes["S"]["c"].iloc[0]
+        assert val is None or pd.isna(val)
+
+    def test_no_op_when_target_equals_raw(self):
+        wb = _loaded({"S": [["c"], ["x"]]})
+        rules = [_rule(source_value="x", target_value="x",
+                       match_mode=MatchMode.EXACT_RAW)]
+        result = apply_rules(wb, rules)
+        assert result.changed_cells == 0
+
+
+# ===================================================================== #
+# find_matching_rule — direct unit test
+# ===================================================================== #
+class TestFindMatchingRule:
+    def test_no_match(self):
+        rules = [_rule(source_value="a", match_mode=MatchMode.EXACT_RAW)]
+        assert find_matching_rule(rules, "S", "c", "b") is None
+
+    def test_match_returns_highest_precedence(self):
+        rules = [
+            _rule(rule_id="w",
+                  source_value="x", target_value="W",
+                  match_mode=MatchMode.EXACT_RAW,
+                  scope_type=ScopeType.WORKBOOK, created_at=0),
+            _rule(rule_id="c",
+                  source_value="x", target_value="C",
+                  match_mode=MatchMode.EXACT_RAW,
+                  scope_type=ScopeType.COLUMN,
+                  scope_sheet="S", scope_column="c",
+                  created_at=1),
+        ]
+        chosen = find_matching_rule(rules, "S", "c", "x")
+        assert chosen is not None and chosen.rule_id == "c"

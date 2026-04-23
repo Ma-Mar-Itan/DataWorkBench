@@ -1,159 +1,128 @@
 """
-Export engine.
+Exporter.
 
-Walks the workbook and applies cleaning rules through the ``RuleIndex``.
-All safety invariants that the original translation exporter guaranteed
-still hold here, because the rule engine enforces them at a lower layer:
+Three outputs:
 
-- Whole-cell matching only. The engine never performs substring matching,
-  so shorter values never leak into longer phrases.
-- Formula cells are skipped. Their formula string is never normalized,
-  matched, or written.
-- Non-string scalars are untouched. Numbers, dates, booleans, None pass through.
-- Blank (``SET_BLANK``) writes ``None`` — a true empty cell, not the string "".
+  1. Cleaned workbook (.xlsx) — written via the openpyxl `wb` that the
+     rules engine already mutated in place. Formulas, sheet names, and
+     non-targeted cells are preserved byte-for-byte where possible.
+
+  2. Statistics report (.xlsx) — a separate workbook summarizing the
+     numeric, categorical, and missingness analyses plus the before/after
+     delta.
+
+  3. Ruleset JSON — the exact ruleset that produced the output, so it can
+     be reapplied to future files.
 """
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Iterable
 
-from openpyxl import load_workbook
-from openpyxl.cell.cell import Cell
-from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.worksheet import Worksheet
+import pandas as pd
+from openpyxl import Workbook
 
-from core.normalizer import trim_and_collapse
-from core.rules_engine import CellContext, RuleIndex
-from models.schemas import CleaningRule
+from models.schemas import (
+    BeforeAfterSummary, CategoricalStats, NumericStats, Rule,
+)
 
-
-# --------------------------------------------------------------------------- #
-
-@dataclass
-class ExportResult:
-    """Summary of an export run."""
-
-    output_bytes: bytes
-    cells_visited: int
-    cells_replaced: int
-    cells_blanked: int
-    cells_skipped_formula: int
-    sheet_count: int
-    # rule_id -> how many cells that rule touched
-    per_rule_counts: Dict[str, int] = field(default_factory=dict)
-
-    @property
-    def total_changed(self) -> int:
-        return self.cells_replaced + self.cells_blanked
+from .workbook_reader import LoadedWorkbook
 
 
-# --------------------------------------------------------------------------- #
-
-def _is_formula_cell(cell: Cell) -> bool:
-    if cell.data_type == "f":
-        return True
-    v = cell.value
-    return isinstance(v, str) and v.startswith("=")
-
-
-def _headers_for(ws: Worksheet) -> Dict[int, str]:
-    """Same header derivation as the extractor — must stay in sync."""
-    headers: Dict[int, str] = {}
-    if ws.max_row and ws.max_row >= 1:
-        first_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=False), ())
-        for cell in first_row:
-            v = cell.value
-            if isinstance(v, str) and v.strip():
-                headers[cell.column] = trim_and_collapse(v)
-    return headers
-
-
-# --------------------------------------------------------------------------- #
-
-def apply_rules(file_bytes: bytes, rules: List[CleaningRule]) -> ExportResult:
-    """Apply ``rules`` to a workbook and return the cleaned bytes.
-
-    Parameters
-    ----------
-    file_bytes:
-        Raw bytes of an .xlsx file.
-    rules:
-        List of ``CleaningRule`` objects. Disabled or invalid rules are
-        skipped by the ``RuleIndex`` constructor.
+# --------------------------------------------------------------------- #
+# Cleaned workbook
+# --------------------------------------------------------------------- #
+def export_cleaned_workbook(loaded: LoadedWorkbook) -> bytes:
     """
-    index = RuleIndex(rules)
-    wb = load_workbook(filename=BytesIO(file_bytes), data_only=False, read_only=False)
+    Serialize the (already mutated) openpyxl workbook to bytes.
 
-    cells_visited = 0
-    cells_replaced = 0
-    cells_blanked = 0
-    formula_skipped = 0
-    per_rule_counts: Dict[str, int] = {}
+    Call `apply_rules(loaded, rules, mutate_workbook=True)` first, then
+    call this. Formulas untouched by any rule are preserved.
+    """
+    buf = BytesIO()
+    loaded.wb.save(buf)
+    return buf.getvalue()
 
-    for sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        headers = _headers_for(ws)
 
-        for row in ws.iter_rows(values_only=False):
-            for cell in row:
-                cells_visited += 1
-                value = cell.value
+# --------------------------------------------------------------------- #
+# Stats report
+# --------------------------------------------------------------------- #
+def export_stats_report(
+    workbook_summary: dict,
+    numeric: list[NumericStats],
+    categorical: list[CategoricalStats],
+    missing_rows: list[dict],
+    before_after: BeforeAfterSummary | None = None,
+) -> bytes:
+    """Build a fresh .xlsx containing all statistical outputs."""
+    wb = Workbook()
+    # Sheet 1: workbook summary
+    ws = wb.active
+    ws.title = "Workbook"
+    ws.append(["Metric", "Value"])
+    for k in ("sheet_count", "total_rows", "total_cols",
+              "total_missing", "total_unique_values"):
+        ws.append([k, workbook_summary.get(k)])
+    ws.append([])
+    ws.append(["Sheet", "Rows", "Cols", "Missing"])
+    for s in workbook_summary.get("per_sheet", []):
+        ws.append([s["sheet"], s["rows"], s["cols"], s["missing"]])
 
-                # Non-strings never match; skip without cost.
-                if not isinstance(value, str):
-                    continue
+    # Sheet 2: numeric
+    ws2 = wb.create_sheet("Numeric")
+    ws2.append(["Sheet", "Column", "Count", "Missing", "Mean",
+                "Median", "Std", "Min", "Q1", "Q3", "Max"])
+    for n in numeric:
+        ws2.append([n.sheet, n.column, n.count, n.missing,
+                    n.mean, n.median, n.std,
+                    n.min_, n.q1, n.q3, n.max_])
 
-                if _is_formula_cell(cell):
-                    formula_skipped += 1
-                    continue
+    # Sheet 3: categorical
+    ws3 = wb.create_sheet("Categorical")
+    ws3.append(["Sheet", "Column", "Non-missing", "Missing",
+                "Unique", "Mode", "Top values"])
+    for c in categorical:
+        top_str = " · ".join(f"{raw} {pct:.1f}%" for raw, _, pct in c.top_values)
+        ws3.append([c.sheet, c.column, c.non_missing, c.missing,
+                    c.unique, c.mode, top_str])
 
-                col_label = headers.get(cell.column) or get_column_letter(cell.column)
-                ctx = CellContext(sheet=sheet_name, column=col_label, raw_value=value)
+    # Sheet 4: missingness
+    ws4 = wb.create_sheet("Missingness")
+    ws4.append(["Sheet", "Column", "Missing", "Total", "Percent"])
+    for m in missing_rows:
+        ws4.append([m["sheet"], m["column"], m["missing"], m["total"],
+                    round(m["pct"], 2)])
 
-                application = index.apply(ctx)
-                if application is None:
-                    continue
-
-                if application.clear_cell:
-                    cell.value = None
-                    cells_blanked += 1
-                else:
-                    cell.value = application.target_value
-                    cells_replaced += 1
-
-                per_rule_counts[application.rule_id] = (
-                    per_rule_counts.get(application.rule_id, 0) + 1
-                )
+    # Sheet 5: before/after (if provided)
+    if before_after is not None:
+        ws5 = wb.create_sheet("Before vs After")
+        ws5.append(["Metric", "Value"])
+        ws5.append(["Changed cells",    before_after.changed_cells])
+        ws5.append(["Affected sheets",  before_after.affected_sheets])
+        ws5.append(["Affected columns", before_after.affected_columns])
+        ws5.append(["Cells blanked",    before_after.missing_added])
+        ws5.append([])
+        ws5.append(["Column", "Before unique", "After unique"])
+        for col, (b, a) in before_after.category_reduction.items():
+            ws5.append([col, b, a])
 
     buf = BytesIO()
     wb.save(buf)
-    sheet_count = len(wb.sheetnames)
-    wb.close()
-
-    return ExportResult(
-        output_bytes=buf.getvalue(),
-        cells_visited=cells_visited,
-        cells_replaced=cells_replaced,
-        cells_blanked=cells_blanked,
-        cells_skipped_formula=formula_skipped,
-        sheet_count=sheet_count,
-        per_rule_counts=per_rule_counts,
-    )
+    return buf.getvalue()
 
 
-# --------------------------------------------------------------------------- #
-
-def suggest_output_filename(original: Optional[str]) -> str:
-    """Return ``<stem>_cleaned.xlsx`` from an original filename."""
-    if not original:
-        return "workbook_cleaned.xlsx"
-    base = original.replace("\\", "/").split("/")[-1]
-    if base.lower().endswith(".xlsx"):
-        base = base[:-5]
-    elif "." in base:
-        base = base.rsplit(".", 1)[0]
-    if not base:
-        base = "workbook"
-    return f"{base}_cleaned.xlsx"
+# --------------------------------------------------------------------- #
+# Ruleset JSON
+# --------------------------------------------------------------------- #
+def export_ruleset(
+    rules: Iterable[Rule],
+    metadata: dict | None = None,
+) -> bytes:
+    """Serialize rules + optional metadata as pretty-printed JSON bytes."""
+    payload = {
+        "schema_version": 1,
+        "metadata":       metadata or {},
+        "rules":          [r.to_dict() for r in rules],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
