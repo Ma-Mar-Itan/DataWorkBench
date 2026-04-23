@@ -98,14 +98,31 @@ _html = html_block
 # App bar
 # --------------------------------------------------------------------------- #
 
-def render_appbar(*, active: str = "Workbench", status_label: str = "Local session") -> None:
-    nav_items = ["Workbench", "Rule Sets", "Preview", "Export"]
+# Map nav label → the section id to scroll to. Each section renders an
+# anchor span with one of these ids just above its card.
+_NAV_TARGETS = {
+    "Workbench": "section-workbench",
+    "Library":   "section-library",
+    "Preview":   "section-preview",
+    "Export":    "section-export",
+}
+
+
+def render_appbar(
+    *,
+    active: str = "Workbench",
+    status_label: str = "Local session",
+    status_kind: str = "ok",   # "ok" | "warn" | "idle"
+) -> None:
+    """Render the red top nav. Status dot color tracks `status_kind`."""
     nav_html = "".join(
-        f'<a class="{"is-active" if item == active else ""}">{item}</a>'
-        for item in nav_items
+        f'<a href="#{_NAV_TARGETS[item]}" class="{"is-active" if item == active else ""}">{item}</a>'
+        for item in _NAV_TARGETS
     )
-    st.markdown(
-        f"""
+    dot_class = {"ok": "tw-dot", "warn": "tw-dot tw-dot--warn", "idle": "tw-dot tw-dot--idle"}.get(
+        status_kind, "tw-dot"
+    )
+    html_block(f"""
         <div class="tw-appbar">
           <div class="tw-appbar__brand">
             <span class="tw-appbar__mark">DC</span>
@@ -116,11 +133,17 @@ def render_appbar(*, active: str = "Workbench", status_label: str = "Local sessi
           </div>
           <nav class="tw-appbar__nav">{nav_html}</nav>
           <div class="tw-appbar__status">
-            <span><span class="tw-dot"></span>{escape(status_label)}</span>
+            <span><span class="{dot_class}"></span>{escape(status_label)}</span>
           </div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """)
+
+
+def scroll_anchor(section_id: str) -> None:
+    """Emit an invisible anchor that the app bar nav links scroll to."""
+    html_block(
+        f'<div id="{escape(section_id)}" '
+        f'style="position:relative; top:-20px; height:0;"></div>'
     )
 
 

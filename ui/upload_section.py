@@ -32,11 +32,7 @@ def render_upload_section() -> None:
         step_state=_step_state(),
         eyebrow="Intake",
         title="Upload workbook",
-        subtitle=(
-            "Select an .xlsx file to scan. The file is read locally; no workbook "
-            "data is transmitted. When run on Streamlit Community Cloud the file "
-            "lives only in the container's session memory."
-        ),
+        subtitle="Drop an .xlsx file to scan. Everything happens locally.",
     ):
         uploaded = st.file_uploader(
             "Drop an .xlsx file or click to browse",
@@ -50,10 +46,8 @@ def render_upload_section() -> None:
                 st.session_state.pop("uploaded_bytes", None)
                 st.session_state.pop("uploaded_name", None)
                 _reset_downstream_state()
-            caption(
-                "Supported format: .xlsx (Excel 2007+). "
-                "Legacy .xls files must be resaved as .xlsx before upload."
-            )
+            # No extra caption — the card subtitle above and Streamlit's own
+            # uploader widget already communicate the format and limits.
             return
 
         file_bytes = uploaded.getvalue()

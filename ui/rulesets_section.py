@@ -15,24 +15,26 @@ from ui.layout import caption, card, chip, html_block
 
 
 def render_rulesets_section(store: RuleSetStore) -> None:
-    """Small utility card for loading/saving/deleting named rule sets."""
+    """Small utility card for loading/saving/deleting named rule sets.
+
+    We only render the card when there is at least one saved rule set —
+    otherwise it's a self-referential empty state sitting at the top of
+    the page, taking up ~180px to tell the user something they can already
+    see (they have nothing to load).
+    """
+    names = store.list_names()
+    if not names:
+        return
+
     with card(
         step=None,
         eyebrow="Library",
         title="Saved rule sets",
         subtitle=(
-            "Reusable cleaning recipes saved to the rulesets/ directory. "
-            "Loading a set replaces the current rules in the workspace."
+            "Reusable cleaning recipes. Loading a set replaces the current "
+            "rules in the workspace."
         ),
     ):
-        names = store.list_names()
-
-        if not names:
-            caption(
-                "No saved rule sets yet. Save one from the export card by "
-                "checking “Also save as rule set” before generating a workbook."
-            )
-            return
 
         # Summary line.
         html_block(f'<div style="margin-bottom:10px; font-size:12.5px; color:var(--tw-ink-3);">'
