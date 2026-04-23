@@ -1,100 +1,221 @@
-"""
-Column type inference.
-
-Called after the workbook has been loaded into pandas. We look at the
-non-null values of a column and decide what it *is*, so the stats engine
-can choose the right summary.
-
-Heuristic, not exhaustive:
-  * numeric   - >=90% of non-missing values are numbers (int/float or numeric-string)
-  * date      - >=90% of non-missing values parse as dates
-  * categorical - small cardinality relative to size (unique/size <= 0.5 and unique <= 50)
-  * free text - otherwise text-heavy (mean length > 25 chars OR > 50 unique values)
-  * mixed     - none of the above cleanly apply
-
-These thresholds are deliberately conservative; we'd rather say "mixed"
-than mislabel a free-text column as categorical.
-"""
-from __future__ import annotations
-
-import re
-from typing import Iterable
+"""Column type inference for statistics generation."""
 
 import pandas as pd
+import numpy as np
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime
 
+from .normalizer import normalize_value
 from models.enums import ColumnType
 
-from .normalizer import is_missing_token, normalize
 
-
-# Simple numeric-string matcher (integer/decimal, optional sign, optional thousands sep)
-_NUMERIC_STR = re.compile(r"^-?\d{1,3}(,\d{3})*(\.\d+)?$|^-?\d+(\.\d+)?$")
-
-# Common date patterns — these are cheap structural checks before pandas parse
-_DATE_PATTERNS = [
-    re.compile(r"^\d{4}-\d{1,2}-\d{1,2}"),                        # ISO 2024-01-15
-    re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$"),                     # 1/15/24
-    re.compile(r"^\d{1,2}-\d{1,2}-\d{2,4}$"),                     # 1-15-2024
-    re.compile(r"^\d{1,2}\.\d{1,2}\.\d{2,4}$"),                   # 1.15.2024
-]
-
-
-def _looks_numeric(v) -> bool:
-    if isinstance(v, bool):
-        return False
-    if isinstance(v, (int, float)) and pd.notna(v):
-        return True
-    if isinstance(v, str):
-        s = v.strip()
-        return bool(_NUMERIC_STR.match(s))
-    return False
-
-
-def _looks_date(v) -> bool:
-    if isinstance(v, pd.Timestamp):
-        return True
-    if not isinstance(v, str):
-        return False
-    s = v.strip()
-    if any(p.match(s) for p in _DATE_PATTERNS):
-        # Final validation via pandas — catches "13/40/2024"
+def infer_column_type(series: pd.Series) -> str:
+    """
+    Infer the type of a column based on its values.
+    
+    Args:
+        series: pandas Series to analyze
+        
+    Returns:
+        ColumnType string
+    """
+    # Drop NaN values for analysis
+    non_null = series.dropna()
+    
+    if len(non_null) == 0:
+        return ColumnType.TEXT.value
+    
+    # Convert to strings for analysis
+    str_values = non_null.astype(str)
+    
+    # Check for numeric
+    numeric_count = 0
+    for val in str_values:
         try:
-            pd.to_datetime(s, errors="raise")
-            return True
-        except Exception:
-            return False
-    return False
+            float(val.replace(",", "").replace("%", ""))
+            numeric_count += 1
+        except (ValueError, AttributeError):
+            pass
+    
+    numeric_ratio = numeric_count / len(non_null)
+    
+    if numeric_ratio > 0.9:
+        return ColumnType.NUMERIC.value
+    
+    # Check for date
+    date_count = 0
+    date_patterns = [
+        r"^\d{1,2}/\d{1,2}/\d{2,4}$",
+        r"^\d{4}-\d{2}-\d{2}$",
+        r"^\d{1,2}-\d{1,2}-\d{2,4}$",
+    ]
+    import re
+    
+    for val in str_values:
+        for pattern in date_patterns:
+            if re.match(pattern, str(val)):
+                date_count += 1
+                break
+    
+    date_ratio = date_count / len(non_null)
+    
+    if date_ratio > 0.8:
+        return ColumnType.DATE.value
+    
+    # Check for categorical (few unique values relative to total)
+    unique_count = len(non_null.unique())
+    unique_ratio = unique_count / len(non_null)
+    
+    if unique_ratio < 0.1 and unique_count < 50:
+        return ColumnType.CATEGORICAL.value
+    
+    # Check for short text (likely categorical or codes)
+    avg_length = str_values.str.len().mean()
+    if avg_length < 15 and unique_ratio < 0.3:
+        return ColumnType.CATEGORICAL.value
+    
+    # Default to text or mixed
+    if unique_ratio > 0.8:
+        return ColumnType.TEXT.value
+    
+    return ColumnType.MIXED.value
 
 
-def infer_column_type(values: Iterable) -> ColumnType:
-    """Return the inferred ColumnType for a column's values."""
-    # Filter out missing tokens and null values
-    filtered = [v for v in values if not is_missing_token(v) and pd.notna(v)]
-    n = len(filtered)
-    if n == 0:
-        return ColumnType.MIXED
+def compute_numeric_stats(series: pd.Series) -> Dict[str, float]:
+    """
+    Compute statistics for a numeric column.
+    
+    Args:
+        series: pandas Series with numeric data
+        
+    Returns:
+        Dict with count, missing, mean, median, std, min, q1, q3, max
+    """
+    # Convert to numeric, coercing errors
+    numeric = pd.to_numeric(series, errors="coerce")
+    
+    count = numeric.notna().sum()
+    missing = numeric.isna().sum()
+    
+    if count == 0:
+        return {
+            "count": 0,
+            "missing": int(missing),
+            "mean": None,
+            "median": None,
+            "std": None,
+            "min": None,
+            "q1": None,
+            "q3": None,
+            "max": None,
+        }
+    
+    return {
+        "count": int(count),
+        "missing": int(missing),
+        "mean": float(numeric.mean()),
+        "median": float(numeric.median()),
+        "std": float(numeric.std()) if count > 1 else 0.0,
+        "min": float(numeric.min()),
+        "q1": float(numeric.quantile(0.25)),
+        "q3": float(numeric.quantile(0.75)),
+        "max": float(numeric.max()),
+    }
 
-    num_hits  = sum(1 for v in filtered if _looks_numeric(v))
-    date_hits = sum(1 for v in filtered if _looks_date(v))
 
-    if num_hits / n >= 0.9:
-        return ColumnType.NUMERIC
-    if date_hits / n >= 0.9:
-        return ColumnType.DATE
+def compute_categorical_stats(series: pd.Series) -> Dict[str, Any]:
+    """
+    Compute statistics for a categorical/text column.
+    
+    Args:
+        series: pandas Series with categorical/text data
+        
+    Returns:
+        Dict with non_missing_count, missing_count, unique_count, mode, top_values
+    """
+    str_series = series.astype(str)
+    
+    # Count missing
+    missing_mask = str_series.isin(["", "nan", "None", "NaN"]) | series.isna()
+    missing_count = missing_mask.sum()
+    non_missing_count = len(series) - missing_count
+    
+    # Get non-missing values
+    non_missing = str_series[~missing_mask]
+    
+    unique_count = len(non_missing.unique())
+    
+    # Get mode (most common value)
+    if len(non_missing) > 0:
+        mode = non_missing.mode().iloc[0] if len(non_missing.mode()) > 0 else None
+    else:
+        mode = None
+    
+    # Get top values with frequencies
+    value_counts = non_missing.value_counts().head(10)
+    top_values = [
+        {"value": str(val), "count": int(count), "percentage": round(100 * count / len(non_missing), 2)}
+        for val, count in value_counts.items()
+    ]
+    
+    return {
+        "non_missing_count": int(non_missing_count),
+        "missing_count": int(missing_count),
+        "unique_count": int(unique_count),
+        "mode": mode,
+        "top_values": top_values,
+    }
 
-    # Cardinality-based: categorical vs free text
-    normalized = [normalize(v) for v in filtered]
-    unique = len(set(normalized))
-    ratio  = unique / n
 
-    # Short strings with low cardinality → categorical
-    mean_len = sum(len(s) for s in normalized) / n
-    if unique <= 50 and ratio <= 0.5 and mean_len <= 25:
-        return ColumnType.CATEGORICAL
+def compute_column_stats(sheet: str, column: str, series: pd.Series) -> Dict[str, Any]:
+    """
+    Compute comprehensive statistics for a column.
+    
+    Args:
+        sheet: Sheet name
+        column: Column name
+        series: pandas Series with column data
+        
+    Returns:
+        Dict with all statistics
+    """
+    inferred_type = infer_column_type(series)
+    
+    stats = {
+        "sheet": sheet,
+        "column": column,
+        "inferred_type": inferred_type,
+        "total_count": len(series),
+    }
+    
+    if inferred_type == ColumnType.NUMERIC.value:
+        numeric_stats = compute_numeric_stats(series)
+        stats.update(numeric_stats)
+        stats["categorical_stats"] = None
+    else:
+        categorical_stats = compute_categorical_stats(series)
+        stats.update(categorical_stats)
+        stats["numeric_stats"] = None
+    
+    return stats
 
-    # Long text or high cardinality → free text
-    if mean_len > 25 or unique > 50:
-        return ColumnType.FREE_TEXT
 
-    # If the column is e.g. 30% numeric, 60% categorical → mixed
-    return ColumnType.MIXED
+def compute_all_column_stats(sheets: Dict[str, pd.DataFrame]) -> Dict[str, Dict[str, Any]]:
+    """
+    Compute statistics for all columns in all sheets.
+    
+    Args:
+        sheets: Dict of sheet_name -> DataFrame
+        
+    Returns:
+        Dict mapping "sheet|column" -> stats dict
+    """
+    all_stats = {}
+    
+    for sheet_name, df in sheets.items():
+        for col_name in df.columns:
+            key = f"{sheet_name}|{col_name}"
+            stats = compute_column_stats(sheet_name, col_name, df[col_name])
+            all_stats[key] = stats
+    
+    return all_stats

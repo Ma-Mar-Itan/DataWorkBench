@@ -1,42 +1,41 @@
-"""
-Enums for the rule system and scan classification.
-
-Kept in their own module so both the schemas and engine modules can
-import them without circular dependencies.
-"""
-from __future__ import annotations
+"""Enum definitions for the spreadsheet cleaner application."""
 
 from enum import Enum
 
 
-class ScopeType(str, Enum):
-    WORKBOOK = "workbook"
-    SHEET    = "sheet"
-    COLUMN   = "column"
-
-
 class MatchMode(str, Enum):
-    EXACT_RAW        = "exact_raw"
+    """Matching modes for cleaning rules."""
+    EXACT_RAW = "exact_raw"
     EXACT_NORMALIZED = "exact_normalized"
 
 
+class ScopeType(str, Enum):
+    """Scope types for cleaning rules."""
+    WORKBOOK = "workbook"
+    SHEET = "sheet"
+    COLUMN = "column"
+
+
 class ActionType(str, Enum):
-    REPLACE   = "replace"
+    """Action types for cleaning rules."""
+    REPLACE = "replace"
     SET_BLANK = "set_blank"
 
 
-class ValueClass(str, Enum):
-    CATEGORICAL   = "categorical"
-    MISSING       = "missing"
-    NUMERIC_LIKE  = "numeric-like"
-    DATE_LIKE     = "date-like"
-    FREE_TEXT     = "free text"
-    LOW_FREQUENCY = "low frequency"
-
-
 class ColumnType(str, Enum):
-    NUMERIC     = "numeric"
+    """Inferred column types."""
+    NUMERIC = "numeric"
     CATEGORICAL = "categorical"
-    FREE_TEXT   = "free text"
-    DATE        = "date"
-    MIXED       = "mixed"
+    TEXT = "text"
+    DATE = "date"
+    MIXED = "mixed"
+
+
+class RulePrecedence:
+    """Rule precedence ordering (lower number = higher priority)."""
+    COLUMN = 1
+    SHEET = 2
+    WORKBOOK = 3
+    
+    MATCH_EXACT_RAW = 1
+    MATCH_EXACT_NORMALIZED = 2

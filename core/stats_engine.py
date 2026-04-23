@@ -1,262 +1,272 @@
-"""
-Descriptive statistics engine.
-
-Everything returned here is derived from the pandas DataFrames held on
-the LoadedWorkbook. Type inference decides which flavor of summary a
-column gets.
-
-Intentionally simple numerics (via pandas .describe() / quantile()) and
-intentionally conservative categorical summaries (normalized counts so
-"Male", "male  ", "MALE" collapse into one bucket when appropriate).
-"""
-from __future__ import annotations
-
-from collections import Counter
-from typing import Any
+"""Statistics engine for generating descriptive statistics."""
 
 import pandas as pd
+from typing import Dict, List, Any, Optional
+from datetime import datetime
 
-from models.enums import ColumnType
-from models.schemas import (
-    BeforeAfterSummary, CategoricalStats, ColumnInference,
-    NumericStats, WorkbookMeta,
-)
-
-from .normalizer import is_missing_token, normalize, to_text
-from .type_inference import infer_column_type
-from .workbook_reader import LoadedWorkbook
+from core.type_inference import compute_all_column_stats, infer_column_type
+from core.normalizer import normalize_value, is_likely_missing
 
 
-# --------------------------------------------------------------------- #
-# Workbook-level summary
-# --------------------------------------------------------------------- #
-def workbook_summary(loaded: LoadedWorkbook) -> dict[str, Any]:
+def generate_workbook_stats(sheets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """
+    Generate workbook-level statistics.
+    
+    Args:
+        sheets: Dict of sheet_name -> DataFrame
+        
+    Returns:
+        Dict with workbook-level statistics
+    """
+    total_rows = 0
+    total_columns = 0
+    total_cells = 0
     total_missing = 0
-    total_unique: set[str] = set()
-    per_sheet: list[dict[str, Any]] = []
-
-    for sheet_name, df in loaded.dataframes.items():
-        sheet_missing = 0
+    all_values = []
+    
+    for sheet_name, df in sheets.items():
+        total_rows += len(df)
+        total_columns += len(df.columns)
+        total_cells += len(df) * len(df.columns)
+        
+        # Count missing values
         for col in df.columns:
-            for v in df[col]:
-                if v is None or (isinstance(v, float) and pd.isna(v)) or is_missing_token(v):
-                    sheet_missing += 1
-                else:
-                    total_unique.add(to_text(v))
-        total_missing += sheet_missing
-        per_sheet.append({
-            "sheet":   sheet_name,
-            "rows":    len(df),
-            "cols":    len(df.columns),
-            "missing": sheet_missing,
-        })
-
+            missing_count = df[col].isna().sum()
+            missing_count += (df[col].astype(str).isin(["", "nan", "None", "NaN"])).sum()
+            total_missing += missing_count
+            
+            # Collect all values for unique count
+            all_values.extend(df[col].dropna().astype(str).tolist())
+    
+    unique_values = set(normalize_value(v) for v in all_values if v)
+    
     return {
-        "sheet_count":         loaded.meta.sheet_count,
-        "total_rows":          loaded.meta.total_rows,
-        "total_cols":          loaded.meta.total_cols,
-        "total_missing":       total_missing,
-        "total_unique_values": len(total_unique),
-        "per_sheet":           per_sheet,
+        "num_sheets": len(sheets),
+        "sheet_names": list(sheets.keys()),
+        "total_rows": total_rows,
+        "total_columns": total_columns,
+        "total_cells": total_cells,
+        "total_missing": total_missing,
+        "unique_values": len(unique_values),
+        "missing_percentage": round(100 * total_missing / max(total_cells, 1), 2),
     }
 
 
-# --------------------------------------------------------------------- #
-# Per-column inference
-# --------------------------------------------------------------------- #
-def infer_all_columns(loaded: LoadedWorkbook) -> list[ColumnInference]:
-    out: list[ColumnInference] = []
-    for sheet_name, df in loaded.dataframes.items():
-        for col in df.columns:
-            dtype = infer_column_type(df[col].tolist())
-            out.append(ColumnInference(sheet=sheet_name, column=col, dtype=dtype))
-    return out
-
-
-# --------------------------------------------------------------------- #
-# Numeric
-# --------------------------------------------------------------------- #
-def _to_float(v: Any) -> float | None:
-    if v is None:
-        return None
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, (int, float)):
-        try:
-            return float(v) if not pd.isna(v) else None
-        except Exception:
-            return None
-    if isinstance(v, str):
-        s = v.strip().replace(",", "")
-        if s == "" or is_missing_token(s):
-            return None
-        try:
-            return float(s)
-        except ValueError:
-            return None
-    return None
-
-
-def numeric_stats(loaded: LoadedWorkbook) -> list[NumericStats]:
-    inferred = {(ci.sheet, ci.column): ci.dtype for ci in infer_all_columns(loaded)}
-    out: list[NumericStats] = []
-
-    for sheet_name, df in loaded.dataframes.items():
-        for col in df.columns:
-            if inferred.get((sheet_name, col)) is not ColumnType.NUMERIC:
-                continue
-            floats = [_to_float(v) for v in df[col]]
-            clean  = [f for f in floats if f is not None]
-            missing = len(floats) - len(clean)
-
-            if not clean:
-                out.append(NumericStats(
-                    column=col, sheet=sheet_name,
-                    count=0, missing=missing,
-                    mean=None, median=None, std=None,
-                    min_=None, q1=None, q3=None, max_=None,
-                ))
-                continue
-
-            s = pd.Series(clean)
-            out.append(NumericStats(
-                column=col, sheet=sheet_name,
-                count=len(clean),
-                missing=missing,
-                mean=float(s.mean()),
-                median=float(s.median()),
-                std=float(s.std(ddof=1)) if len(clean) > 1 else 0.0,
-                min_=float(s.min()),
-                q1=float(s.quantile(0.25)),
-                q3=float(s.quantile(0.75)),
-                max_=float(s.max()),
-            ))
-    return out
-
-
-# --------------------------------------------------------------------- #
-# Categorical
-# --------------------------------------------------------------------- #
-def categorical_stats(
-    loaded: LoadedWorkbook,
-    top_n: int = 5,
-) -> list[CategoricalStats]:
-    inferred = {(ci.sheet, ci.column): ci.dtype for ci in infer_all_columns(loaded)}
-    out: list[CategoricalStats] = []
-
-    for sheet_name, df in loaded.dataframes.items():
-        for col in df.columns:
-            if inferred.get((sheet_name, col)) is not ColumnType.CATEGORICAL:
-                continue
-
-            non_missing_raw: list[str] = []
-            missing = 0
-            for v in df[col]:
-                if v is None or (isinstance(v, float) and pd.isna(v)) or is_missing_token(v):
-                    missing += 1
-                else:
-                    non_missing_raw.append(to_text(v))
-
-            non_missing = len(non_missing_raw)
-            if non_missing == 0:
-                out.append(CategoricalStats(
-                    column=col, sheet=sheet_name,
-                    non_missing=0, missing=missing, unique=0,
-                    mode=None, top_values=[],
-                ))
-                continue
-
-            # Count by normalized form, but keep the most common *raw*
-            # representation of each bucket as its display value.
-            by_norm: dict[str, Counter] = {}
-            for raw in non_missing_raw:
-                n = normalize(raw)
-                by_norm.setdefault(n, Counter())[raw] += 1
-
-            buckets: list[tuple[str, int]] = []
-            for n, raw_counter in by_norm.items():
-                display = raw_counter.most_common(1)[0][0]
-                buckets.append((display, sum(raw_counter.values())))
-            buckets.sort(key=lambda kv: -kv[1])
-
-            total = sum(c for _, c in buckets)
-            top = [
-                (raw, cnt, (cnt / total * 100.0) if total else 0.0)
-                for raw, cnt in buckets[:top_n]
-            ]
-
-            out.append(CategoricalStats(
-                column=col, sheet=sheet_name,
-                non_missing=non_missing, missing=missing,
-                unique=len(buckets),
-                mode=buckets[0][0],
-                top_values=top,
-            ))
-    return out
-
-
-# --------------------------------------------------------------------- #
-# Missingness
-# --------------------------------------------------------------------- #
-def missingness(loaded: LoadedWorkbook) -> list[dict[str, Any]]:
-    out = []
-    for sheet_name, df in loaded.dataframes.items():
-        for col in df.columns:
-            total = len(df[col])
-            if total == 0:
-                continue
-            missing = sum(
-                1 for v in df[col]
-                if v is None or (isinstance(v, float) and pd.isna(v)) or is_missing_token(v)
-            )
-            out.append({
-                "sheet":   sheet_name,
-                "column":  col,
-                "missing": missing,
-                "total":   total,
-                "pct":     (missing / total * 100.0) if total else 0.0,
-            })
-    out.sort(key=lambda d: -d["pct"])
-    return out
-
-
-# --------------------------------------------------------------------- #
-# Before vs after
-# --------------------------------------------------------------------- #
-def before_after(
-    before: LoadedWorkbook,
-    after: LoadedWorkbook,
-    apply_result,
-) -> BeforeAfterSummary:
+def generate_column_stats(sheets: Dict[str, pd.DataFrame]) -> List[Dict[str, Any]]:
     """
-    Summarize the impact of a cleaning pass.
-
-    We compute category-reduction by comparing normalized unique counts
-    per categorical column before vs after.
+    Generate per-column statistics.
+    
+    Args:
+        sheets: Dict of sheet_name -> DataFrame
+        
+    Returns:
+        List of column statistics dicts
     """
-    inferred = {(ci.sheet, ci.column): ci.dtype for ci in infer_all_columns(before)}
+    stats_list = []
+    
+    for sheet_name, df in sheets.items():
+        for col_name in df.columns:
+            series = df[col_name]
+            
+            # Infer type
+            inferred_type = infer_column_type(series)
+            
+            # Basic counts
+            total_count = len(series)
+            missing_count = series.isna().sum()
+            missing_count += (series.astype(str).isin(["", "nan", "None", "NaN"])).sum()
+            non_missing = series.dropna()
+            non_missing = non_missing[~non_missing.astype(str).isin(["", "nan", "None", "NaN"])]
+            unique_count = len(non_missing.unique()) if len(non_missing) > 0 else 0
+            
+            col_stats = {
+                "sheet": sheet_name,
+                "column": col_name,
+                "inferred_type": inferred_type,
+                "total_count": int(total_count),
+                "missing_count": int(missing_count),
+                "non_missing_count": int(total_count - missing_count),
+                "unique_count": int(unique_count),
+            }
+            
+            # Type-specific stats
+            if inferred_type == "numeric":
+                numeric = pd.to_numeric(series, errors="coerce")
+                non_null_numeric = numeric.dropna()
+                
+                if len(non_null_numeric) > 0:
+                    col_stats["numeric_stats"] = {
+                        "mean": round(float(non_null_numeric.mean()), 4),
+                        "median": round(float(non_null_numeric.median()), 4),
+                        "std": round(float(non_null_numeric.std()), 4) if len(non_null_numeric) > 1 else 0,
+                        "min": float(non_null_numeric.min()),
+                        "max": float(non_null_numeric.max()),
+                        "q1": round(float(non_null_numeric.quantile(0.25)), 4),
+                        "q3": round(float(non_null_numeric.quantile(0.75)), 4),
+                    }
+            
+            # Categorical stats for non-numeric columns
+            if inferred_type != "numeric" and len(non_missing) > 0:
+                value_counts = non_missing.astype(str).value_counts().head(10)
+                top_values = [
+                    {
+                        "value": str(val),
+                        "count": int(count),
+                        "percentage": round(100 * count / len(non_missing), 2)
+                    }
+                    for val, count in value_counts.items()
+                ]
+                col_stats["categorical_stats"] = {
+                    "mode": str(value_counts.index[0]) if len(value_counts) > 0 else None,
+                    "top_values": top_values,
+                }
+            
+            stats_list.append(col_stats)
+    
+    return stats_list
 
-    cat_reduction: dict[str, tuple[int, int]] = {}
-    for (sheet, col), dtype in inferred.items():
-        if dtype is not ColumnType.CATEGORICAL:
+
+def generate_before_after_stats(
+    original_sheets: Dict[str, pd.DataFrame],
+    cleaned_sheets: Dict[str, pd.DataFrame]
+) -> Dict[str, Any]:
+    """
+    Generate before/after comparison statistics.
+    
+    Args:
+        original_sheets: Original data
+        cleaned_sheets: Cleaned data
+        
+    Returns:
+        Dict with before/after comparison
+    """
+    # Count total changes
+    total_changes = 0
+    
+    for sheet_name in original_sheets:
+        if sheet_name not in cleaned_sheets:
             continue
-        before_vals = before.dataframes[sheet][col]
-        after_vals  = after.dataframes[sheet][col]
-        b = {normalize(v) for v in before_vals if not is_missing_token(v) and v is not None}
-        a = {normalize(v) for v in after_vals  if not is_missing_token(v) and v is not None}
-        if len(b) != len(a):
-            cat_reduction[f"{sheet}.{col}"] = (len(b), len(a))
+        
+        orig_df = original_sheets[sheet_name]
+        clean_df = cleaned_sheets[sheet_name]
+        
+        for col_name in orig_df.columns:
+            for row_idx in range(len(orig_df)):
+                orig_val = orig_df.at[row_idx, col_name]
+                clean_val = clean_df.at[row_idx, col_name]
+                
+                orig_str = "" if pd.isna(orig_val) else str(orig_val)
+                clean_str = "" if pd.isna(clean_val) else str(clean_val)
+                
+                if orig_str != clean_str:
+                    total_changes += 1
+    
+    # Get category distribution changes for categorical columns
+    category_changes = {}
+    
+    for sheet_name in original_sheets:
+        if sheet_name not in cleaned_sheets:
+            continue
+        
+        orig_df = original_sheets[sheet_name]
+        clean_df = cleaned_sheets[sheet_name]
+        
+        for col_name in orig_df.columns:
+            orig_type = infer_column_type(orig_df[col_name])
+            
+            if orig_type in ["categorical", "text"]:
+                orig_counts = orig_df[col_name].dropna().astype(str).value_counts().head(5)
+                clean_counts = clean_df[col_name].dropna().astype(str).value_counts().head(5)
+                
+                orig_unique = len(orig_df[col_name].dropna().unique())
+                clean_unique = len(clean_df[col_name].dropna().unique())
+                
+                if orig_unique != clean_unique:
+                    key = f"{sheet_name}.{col_name}"
+                    category_changes[key] = {
+                        "before_unique": orig_unique,
+                        "after_unique": clean_unique,
+                        "reduction": orig_unique - clean_unique,
+                        "before_top": {str(k): int(v) for k, v in orig_counts.items()},
+                        "after_top": {str(k): int(v) for k, v in clean_counts.items()},
+                    }
+    
+    return {
+        "total_changes": total_changes,
+        "affected_columns": len(category_changes),
+        "category_changes": category_changes,
+        "generated_at": datetime.now().isoformat(),
+    }
 
-    # "Missing added" = cells that became blank via set_blank
-    missing_added = sum(
-        1 for ch in apply_result.changes
-        if ch.after in (None, "", "nan")
-    )
 
-    return BeforeAfterSummary(
-        changed_cells=apply_result.changed_cells,
-        affected_sheets=len(apply_result.affected_sheets),
-        affected_columns=len(apply_result.affected_columns),
-        category_reduction=cat_reduction,
-        missing_added=missing_added,
-    )
+def generate_full_statistics_report(
+    sheets: Dict[str, pd.DataFrame],
+    cleaned_sheets: Optional[Dict[str, pd.DataFrame]] = None
+) -> Dict[str, Any]:
+    """
+    Generate a complete statistics report.
+    
+    Args:
+        sheets: Original data
+        cleaned_sheets: Optional cleaned data for before/after comparison
+        
+    Returns:
+        Complete statistics report dict
+    """
+    report = {
+        "workbook": generate_workbook_stats(sheets),
+        "columns": generate_column_stats(sheets),
+        "generated_at": datetime.now().isoformat(),
+    }
+    
+    if cleaned_sheets is not None:
+        report["before_after"] = generate_before_after_stats(sheets, cleaned_sheets)
+    
+    return report
+
+
+def get_missing_token_summary(sheets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """
+    Get summary of likely missing tokens in the data.
+    
+    Args:
+        sheets: Original data
+        
+    Returns:
+        Dict with missing token analysis
+    """
+    missing_tokens = {}
+    
+    for sheet_name, df in sheets.items():
+        for col_name in df.columns:
+            for val in df[col_name].dropna().unique():
+                str_val = str(val)
+                if is_likely_missing(str_val):
+                    normalized = normalize_value(str_val)
+                    
+                    if normalized not in missing_tokens:
+                        missing_tokens[normalized] = {
+                            "variants": [],
+                            "locations": [],
+                            "total_count": 0,
+                        }
+                    
+                    # Count occurrences
+                    count = (df[col_name].astype(str) == str_val).sum()
+                    
+                    if str_val not in missing_tokens[normalized]["variants"]:
+                        missing_tokens[normalized]["variants"].append(str_val)
+                    
+                    missing_tokens[normalized]["total_count"] += count
+                    
+                    if len(missing_tokens[normalized]["locations"]) < 5:
+                        missing_tokens[normalized]["locations"].append({
+                            "sheet": sheet_name,
+                            "column": col_name,
+                            "example": str_val,
+                        })
+    
+    return {
+        "total_missing_variants": len(missing_tokens),
+        "tokens": missing_tokens,
+    }

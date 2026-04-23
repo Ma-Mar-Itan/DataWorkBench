@@ -1,128 +1,184 @@
-"""
-Exporter.
-
-Three outputs:
-
-  1. Cleaned workbook (.xlsx) — written via the openpyxl `wb` that the
-     rules engine already mutated in place. Formulas, sheet names, and
-     non-targeted cells are preserved byte-for-byte where possible.
-
-  2. Statistics report (.xlsx) — a separate workbook summarizing the
-     numeric, categorical, and missingness analyses plus the before/after
-     delta.
-
-  3. Ruleset JSON — the exact ruleset that produced the output, so it can
-     be reapplied to future files.
-"""
-from __future__ import annotations
+"""Exporter for cleaned workbooks, statistics, and rulesets."""
 
 import json
-from io import BytesIO
-from typing import Iterable
-
 import pandas as pd
-from openpyxl import Workbook
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+from datetime import datetime
 
-from models.schemas import (
-    BeforeAfterSummary, CategoricalStats, NumericStats, Rule,
-)
-
-from .workbook_reader import LoadedWorkbook
+from models.schemas import Rule
 
 
-# --------------------------------------------------------------------- #
-# Cleaned workbook
-# --------------------------------------------------------------------- #
-def export_cleaned_workbook(loaded: LoadedWorkbook) -> bytes:
+def export_cleaned_workbook(sheets: Dict[str, pd.DataFrame], 
+                            output_path: str) -> str:
     """
-    Serialize the (already mutated) openpyxl workbook to bytes.
-
-    Call `apply_rules(loaded, rules, mutate_workbook=True)` first, then
-    call this. Formulas untouched by any rule are preserved.
+    Export cleaned data to Excel file.
+    
+    Args:
+        sheets: Dict of sheet_name -> DataFrame
+        output_path: Path for output file
+        
+    Returns:
+        Path to exported file
     """
-    buf = BytesIO()
-    loaded.wb.save(buf)
-    return buf.getvalue()
+    output = Path(output_path)
+    
+    # Ensure output directory exists
+    output.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write to Excel
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        for sheet_name, df in sheets.items():
+            # Excel sheet names have 31 character limit
+            safe_name = str(sheet_name)[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+    
+    return str(output)
 
 
-# --------------------------------------------------------------------- #
-# Stats report
-# --------------------------------------------------------------------- #
-def export_stats_report(
-    workbook_summary: dict,
-    numeric: list[NumericStats],
-    categorical: list[CategoricalStats],
-    missing_rows: list[dict],
-    before_after: BeforeAfterSummary | None = None,
-) -> bytes:
-    """Build a fresh .xlsx containing all statistical outputs."""
-    wb = Workbook()
-    # Sheet 1: workbook summary
-    ws = wb.active
-    ws.title = "Workbook"
-    ws.append(["Metric", "Value"])
-    for k in ("sheet_count", "total_rows", "total_cols",
-              "total_missing", "total_unique_values"):
-        ws.append([k, workbook_summary.get(k)])
-    ws.append([])
-    ws.append(["Sheet", "Rows", "Cols", "Missing"])
-    for s in workbook_summary.get("per_sheet", []):
-        ws.append([s["sheet"], s["rows"], s["cols"], s["missing"]])
-
-    # Sheet 2: numeric
-    ws2 = wb.create_sheet("Numeric")
-    ws2.append(["Sheet", "Column", "Count", "Missing", "Mean",
-                "Median", "Std", "Min", "Q1", "Q3", "Max"])
-    for n in numeric:
-        ws2.append([n.sheet, n.column, n.count, n.missing,
-                    n.mean, n.median, n.std,
-                    n.min_, n.q1, n.q3, n.max_])
-
-    # Sheet 3: categorical
-    ws3 = wb.create_sheet("Categorical")
-    ws3.append(["Sheet", "Column", "Non-missing", "Missing",
-                "Unique", "Mode", "Top values"])
-    for c in categorical:
-        top_str = " · ".join(f"{raw} {pct:.1f}%" for raw, _, pct in c.top_values)
-        ws3.append([c.sheet, c.column, c.non_missing, c.missing,
-                    c.unique, c.mode, top_str])
-
-    # Sheet 4: missingness
-    ws4 = wb.create_sheet("Missingness")
-    ws4.append(["Sheet", "Column", "Missing", "Total", "Percent"])
-    for m in missing_rows:
-        ws4.append([m["sheet"], m["column"], m["missing"], m["total"],
-                    round(m["pct"], 2)])
-
-    # Sheet 5: before/after (if provided)
-    if before_after is not None:
-        ws5 = wb.create_sheet("Before vs After")
-        ws5.append(["Metric", "Value"])
-        ws5.append(["Changed cells",    before_after.changed_cells])
-        ws5.append(["Affected sheets",  before_after.affected_sheets])
-        ws5.append(["Affected columns", before_after.affected_columns])
-        ws5.append(["Cells blanked",    before_after.missing_added])
-        ws5.append([])
-        ws5.append(["Column", "Before unique", "After unique"])
-        for col, (b, a) in before_after.category_reduction.items():
-            ws5.append([col, b, a])
-
-    buf = BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
+def export_statistics_report(stats: Dict[str, Any], 
+                             output_path: str,
+                             format: str = "json") -> str:
+    """
+    Export statistics report to file.
+    
+    Args:
+        stats: Statistics dict
+        output_path: Path for output file
+        format: Output format ("json" or "csv")
+        
+    Returns:
+        Path to exported file
+    """
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    
+    if format == "json":
+        # Ensure JSON serializable
+        clean_stats = make_json_serializable(stats)
+        
+        with open(output, "w", encoding="utf-8") as f:
+            json.dump(clean_stats, f, indent=2, ensure_ascii=False)
+    
+    elif format == "csv":
+        # Export column stats as CSV
+        if "columns" in stats:
+            df = pd.DataFrame(stats["columns"])
+            df.to_csv(output, index=False, encoding="utf-8-sig")
+        else:
+            # Fallback: write JSON anyway
+            clean_stats = make_json_serializable(stats)
+            with open(output, "w", encoding="utf-8") as f:
+                json.dump(clean_stats, f, indent=2, ensure_ascii=False)
+    
+    return str(output)
 
 
-# --------------------------------------------------------------------- #
-# Ruleset JSON
-# --------------------------------------------------------------------- #
-def export_ruleset(
-    rules: Iterable[Rule],
-    metadata: dict | None = None,
-) -> bytes:
-    """Serialize rules + optional metadata as pretty-printed JSON bytes."""
-    payload = {
-        "schema_version": 1,
-        "metadata":       metadata or {},
-        "rules":          [r.to_dict() for r in rules],
+def export_ruleset(rules: List[Rule], output_path: str) -> str:
+    """
+    Export cleaning rules to JSON file.
+    
+    Args:
+        rules: List of Rule objects
+        output_path: Path for output file
+        
+    Returns:
+        Path to exported file
+    """
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    
+    rules_data = {
+        "version": "1.0",
+        "exported_at": datetime.now().isoformat(),
+        "rules_count": len(rules),
+        "rules": [rule.to_dict() for rule in rules],
     }
-    return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    
+    with open(output, "w", encoding="utf-8") as f:
+        json.dump(rules_data, f, indent=2, ensure_ascii=False)
+    
+    return str(output)
+
+
+def load_ruleset(input_path: str) -> List[Rule]:
+    """
+    Load cleaning rules from JSON file.
+    
+    Args:
+        input_path: Path to ruleset file
+        
+    Returns:
+        List of Rule objects
+    """
+    with open(input_path, "r", encoding="utf-8") as f:
+        rules_data = json.load(f)
+    
+    rules = []
+    for rule_dict in rules_data.get("rules", []):
+        rules.append(Rule.from_dict(rule_dict))
+    
+    return rules
+
+
+def make_json_serializable(obj: Any) -> Any:
+    """
+    Convert object to JSON-serializable form.
+    
+    Handles:
+    - Sets -> lists
+    - Non-serializable types -> strings
+    - NaN/Inf -> None
+    """
+    import math
+    
+    if isinstance(obj, dict):
+        return {k: make_json_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_serializable(item) for item in obj]
+    elif isinstance(obj, set):
+        return list(obj)
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict("records")
+    elif isinstance(obj, pd.Series):
+        return obj.tolist()
+    else:
+        try:
+            # Test if JSON serializable
+            json.dumps(obj)
+            return obj
+        except (TypeError, ValueError):
+            return str(obj)
+
+
+def create_export_summary(sheets: Dict[str, pd.DataFrame],
+                          rules: List[Rule],
+                          stats: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create a summary of what will be exported.
+    
+    Args:
+        sheets: Cleaned data
+        rules: Applied rules
+        stats: Statistics
+        
+    Returns:
+        Summary dict
+    """
+    total_rows = sum(len(df) for df in sheets.values())
+    total_columns = sum(len(df.columns) for df in sheets.values())
+    
+    return {
+        "sheets_exported": list(sheets.keys()),
+        "total_rows": total_rows,
+        "total_columns": total_columns,
+        "rules_applied": len([r for r in rules if r.enabled]),
+        "statistics_generated": bool(stats),
+        "export_timestamp": datetime.now().isoformat(),
+    }

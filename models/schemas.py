@@ -1,171 +1,161 @@
-"""
-Core dataclasses.
+"""Schema definitions for the spreadsheet cleaner application."""
 
-Using `dataclass` rather than pydantic keeps zero runtime deps and is
-plenty for internal engine state. Validation lives in the ruleset_store
-loader for JSON input.
-"""
-from __future__ import annotations
-
-from dataclasses import dataclass, field, asdict
-from typing import Any
-
-from .enums import ActionType, ColumnType, MatchMode, ScopeType, ValueClass
+from dataclasses import dataclass, field
+from typing import Optional, Dict, List, Any
+from datetime import datetime
 
 
-# --------------------------------------------------------------------- #
-# Rules
-# --------------------------------------------------------------------- #
 @dataclass
 class Rule:
-    rule_id:      str
+    """A cleaning rule definition."""
+    rule_id: str
     source_value: str
-    target_value: str                                = ""
-    action_type:  ActionType                         = ActionType.REPLACE
-    match_mode:   MatchMode                          = MatchMode.EXACT_NORMALIZED
-    scope_type:   ScopeType                          = ScopeType.WORKBOOK
-    scope_sheet:  str                                = ""
-    scope_column: str                                = ""
-    enabled:      bool                               = True
-    # order of creation — used as final tie-breaker in precedence
-    created_at:   int                                = 0
-
-    def to_dict(self) -> dict:
-        d = asdict(self)
-        # Convert Enums back to their string values
-        for k in ("action_type", "match_mode", "scope_type"):
-            v = d.get(k)
-            if hasattr(v, "value"):
-                d[k] = v.value
-        return d
-
+    target_value: str
+    action_type: str  # "replace" or "set_blank"
+    match_mode: str  # "exact_raw" or "exact_normalized"
+    scope_type: str  # "workbook", "sheet", or "column"
+    scope_sheet: Optional[str] = None
+    scope_column: Optional[str] = None
+    enabled: bool = True
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert rule to dictionary for JSON serialization."""
+        return {
+            "rule_id": self.rule_id,
+            "source_value": self.source_value,
+            "target_value": self.target_value,
+            "action_type": self.action_type,
+            "match_mode": self.match_mode,
+            "scope_type": self.scope_type,
+            "scope_sheet": self.scope_sheet,
+            "scope_column": self.scope_column,
+            "enabled": self.enabled,
+            "created_at": self.created_at,
+        }
+    
     @classmethod
-    def from_dict(cls, d: dict) -> "Rule":
+    def from_dict(cls, data: Dict[str, Any]) -> "Rule":
+        """Create a Rule from a dictionary."""
         return cls(
-            rule_id=str(d["rule_id"]),
-            source_value=str(d.get("source_value", "")),
-            target_value=str(d.get("target_value", "")),
-            action_type=ActionType(d.get("action_type", ActionType.REPLACE.value)),
-            match_mode=MatchMode(d.get("match_mode", MatchMode.EXACT_NORMALIZED.value)),
-            scope_type=ScopeType(d.get("scope_type", ScopeType.WORKBOOK.value)),
-            scope_sheet=str(d.get("scope_sheet", "") or ""),
-            scope_column=str(d.get("scope_column", "") or ""),
-            enabled=bool(d.get("enabled", True)),
-            created_at=int(d.get("created_at", 0)),
+            rule_id=data["rule_id"],
+            source_value=data["source_value"],
+            target_value=data["target_value"],
+            action_type=data["action_type"],
+            match_mode=data["match_mode"],
+            scope_type=data["scope_type"],
+            scope_sheet=data.get("scope_sheet"),
+            scope_column=data.get("scope_column"),
+            enabled=data.get("enabled", True),
+            created_at=data.get("created_at", datetime.now().isoformat()),
         )
 
 
-# --------------------------------------------------------------------- #
-# Scan artifacts
-# --------------------------------------------------------------------- #
 @dataclass
-class CellCoord:
-    sheet:  str
-    row:    int          # 1-based (matches Excel row numbers)
-    column: str          # header label (or A1-style if no header)
-
-
-@dataclass
-class ValueOccurrence:
-    raw_value:        str
-    normalized_value: str
-    total_count:      int
-    per_sheet:        dict[str, int]       = field(default_factory=dict)
-    per_column:       dict[str, int]       = field(default_factory=dict)   # "Sheet::Column"
-    examples:         list[CellCoord]      = field(default_factory=list)
-    value_class:      ValueClass           = ValueClass.FREE_TEXT
-
-
-@dataclass
-class SheetMeta:
-    name: str
-    rows: int            # data rows (excluding header)
-    cols: int
-    headers: list[str]   = field(default_factory=list)
-
-
-@dataclass
-class WorkbookMeta:
-    filename:             str
-    sheet_count:          int
-    total_rows:           int
-    total_cols:           int
-    sheets:               list[SheetMeta]         = field(default_factory=list)
-    total_unique_strings: int                     = 0
-    total_missing_tokens: int                     = 0
-
-
-@dataclass
-class ScanResult:
-    workbook: WorkbookMeta
-    values:   list[ValueOccurrence]               = field(default_factory=list)
-
-
-# --------------------------------------------------------------------- #
-# Preview / apply
-# --------------------------------------------------------------------- #
-@dataclass
-class CellChange:
-    sheet:     str
-    row:       int
-    column:    str
-    before:    Any
-    after:     Any
-    rule_id:   str
-
-
-@dataclass
-class ApplyResult:
-    changes:           list[CellChange]        = field(default_factory=list)
-    fires_per_rule:    dict[str, int]          = field(default_factory=dict)
-    affected_sheets:   set[str]                = field(default_factory=set)
-    affected_columns:  set[str]                = field(default_factory=set)
-
-    @property
-    def changed_cells(self) -> int:
-        return len(self.changes)
-
-
-# --------------------------------------------------------------------- #
-# Statistics
-# --------------------------------------------------------------------- #
-@dataclass
-class NumericStats:
-    column: str
+class ValueLocation:
+    """Tracks where a value appears in the workbook."""
     sheet: str
-    count:   int
-    missing: int
-    mean:    float | None
-    median:  float | None
-    std:     float | None
-    min_:    float | None
-    q1:      float | None
-    q3:      float | None
-    max_:    float | None
+    column: str
+    row_index: int
+    cell_value: Any
 
 
 @dataclass
-class CategoricalStats:
-    column:       str
-    sheet:        str
-    non_missing:  int
-    missing:      int
-    unique:       int
-    mode:         str | None
-    top_values:   list[tuple[str, int, float]] = field(default_factory=list)   # (value, count, pct)
+class ValueFrequency:
+    """Frequency information for a unique value."""
+    raw_value: str
+    normalized_value: str
+    total_count: int
+    locations: List[ValueLocation] = field(default_factory=list)
+    sheets: set = field(default_factory=set)
+    columns: set = field(default_factory=set)
+    is_likely_missing: bool = False
+    inferred_type: str = "unknown"
+    
+    def __post_init__(self):
+        if isinstance(self.sheets, list):
+            self.sheets = set(self.sheets)
+        if isinstance(self.columns, list):
+            self.columns = set(self.columns)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "raw_value": self.raw_value,
+            "normalized_value": self.normalized_value,
+            "total_count": self.total_count,
+            "sheets": list(self.sheets),
+            "columns": list(self.columns),
+            "is_likely_missing": self.is_likely_missing,
+            "inferred_type": self.inferred_type,
+            "sample_locations": [
+                {"sheet": loc.sheet, "column": loc.column, "row": loc.row_index}
+                for loc in self.locations[:5]  # Only include first 5 as samples
+            ],
+        }
 
 
 @dataclass
-class ColumnInference:
-    sheet:   str
-    column:  str
-    dtype:   ColumnType
+class WorkbookMetadata:
+    """Metadata about the uploaded workbook."""
+    file_name: str
+    num_sheets: int
+    sheet_names: List[str]
+    rows_per_sheet: Dict[str, int]
+    columns_per_sheet: Dict[str, int]
+    total_unique_values: int
+    total_cells: int
+    missing_token_count: int
 
 
 @dataclass
-class BeforeAfterSummary:
-    changed_cells:          int
-    affected_sheets:        int
-    affected_columns:       int
-    category_reduction:     dict[str, tuple[int, int]]       # column -> (before_unique, after_unique)
-    missing_added:          int                               # cells blanked by set_blank
+class ColumnStats:
+    """Statistics for a single column."""
+    sheet: str
+    column: str
+    inferred_type: str
+    count: int
+    missing_count: int
+    unique_count: int
+    numeric_stats: Optional[Dict[str, float]] = None
+    categorical_stats: Optional[Dict[str, Any]] = None
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "sheet": self.sheet,
+            "column": self.column,
+            "inferred_type": self.inferred_type,
+            "count": self.count,
+            "missing_count": self.missing_count,
+            "unique_count": self.unique_count,
+            "numeric_stats": self.numeric_stats,
+            "categorical_stats": self.categorical_stats,
+        }
+
+
+@dataclass
+class CleaningResult:
+    """Results from applying cleaning rules."""
+    total_changes: int
+    affected_sheets: set
+    affected_columns: set
+    changes_by_rule: Dict[str, int]
+    before_stats: Dict[str, Any]
+    after_stats: Dict[str, Any]
+    
+    def __post_init__(self):
+        if isinstance(self.affected_sheets, list):
+            self.affected_sheets = set(self.affected_sheets)
+        if isinstance(self.affected_columns, list):
+            self.affected_columns = set(self.affected_columns)
+
+
+@dataclass
+class PreviewData:
+    """Preview data for before/after comparison."""
+    sheet: str
+    original_df: Any  # pandas DataFrame
+    cleaned_df: Any   # pandas DataFrame
+    changed_cells: List[tuple]  # List of (row, col) tuples
+    applied_rules: List[str]
