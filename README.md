@@ -1,4 +1,4 @@
-# Spreadsheet Cleaner
+# [Currently Broken] Spreadsheet Cleaner
 
 A professional Streamlit web application for cleaning Excel spreadsheet data with a premium desktop-style UI.
 
